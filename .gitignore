@@ -1,0 +1,38 @@
+# 环境与密钥
+.env
+*.env
+!.env.example
+
+# Python 缓存与虚拟环境
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 日志
+*.log
+server.log
+
+# 测试临时 MySQL 实例目录
+.mysql-test-*/
+
+# 文档与图片素材（本地资料，不入库）
+*.docx
+*.pdf
+图片/
+*.jpg
+*.jpeg
+*.png
+_extract/
+_out.txt
+链路逻辑.txt
+/积分问题测试报告.md
+/运营门户校招面试准备文档.md
+
+# 编辑器 / 系统
+.claude/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

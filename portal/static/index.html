@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>IT 运营门户</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- 登录 -->
+  <div id="login-screen" class="login-screen">
+    <div class="login-card">
+      <div class="logo">🏢 <span>IT 运营门户</span></div>
+      <input id="login-username" placeholder="用户名" autocomplete="username" />
+      <input id="login-password" type="password" placeholder="密码" autocomplete="current-password" />
+      <button id="login-btn" class="btn-primary">登 录</button>
+      <p id="login-error" class="error"></p>
+      <p class="login-hint">请使用管理员分配的账号登录；演示环境与正式数据隔离。</p>
+    </div>
+  </div>
+
+  <!-- 主应用 -->
+  <div id="app" class="app hidden">
+    <header class="topbar">
+      <div class="brand">🏢 IT 运营门户</div>
+      <div class="search-wrap">
+        <input id="search-input" placeholder="🔍 搜索课程 / 礼品…" />
+        <div id="search-results" class="search-results hidden"></div>
+      </div>
+      <div class="user-area">
+        <div class="bell-wrap">
+          <button id="bell-btn" class="bell-btn" title="通知">🔔<span id="bell-badge" class="bell-badge hidden">0</span></button>
+          <div id="bell-dropdown" class="bell-dropdown hidden"></div>
+        </div>
+        <span id="points-badge" class="points-badge">⭐ 0</span>
+        <span id="user-name" class="user-name"></span>
+        <button id="admin-toggle" class="btn-ghost hidden">⚙️ 进入后台</button>
+        <button id="logout-btn" class="btn-ghost">退出</button>
+      </div>
+    </header>
+
+    <!-- 用户端 -->
+    <nav id="user-nav" class="tabs">
+      <button class="tab active" data-tab="home">🏠 首页</button>
+      <button class="tab" data-tab="courses">📚 课程</button>
+      <button class="tab" data-tab="gifts">🎁 礼品</button>
+      <button class="tab" data-tab="activities">🎪 活动公告</button>
+      <button class="tab" data-tab="points">⭐ 我的积分</button>
+    </nav>
+
+    <main id="user-main" class="main">
+      <section id="tab-home" class="tab-panel"></section>
+      <section id="tab-courses" class="tab-panel hidden"></section>
+      <section id="tab-gifts" class="tab-panel hidden"></section>
+      <section id="tab-activities" class="tab-panel hidden"></section>
+      <section id="tab-points" class="tab-panel hidden"></section>
+    </main>
+
+    <!-- 管理后台 -->
+    <div id="admin-panel" class="admin-panel hidden">
+      <aside class="admin-sidebar">
+        <div class="admin-title">⚙️ 管理后台</div>
+        <button class="admin-nav active" data-section="dashboard">📊 数据看板</button>
+        <button class="admin-nav" data-section="courses">📚 课程管理</button>
+        <button class="admin-nav" data-section="activities">🎪 活动管理</button>
+        <button class="admin-nav" data-section="gifts">🎁 积分兑换</button>
+        <button class="admin-nav" data-section="orders">🚚 订单发货</button>
+        <button class="admin-nav" data-section="audit">📜 审计日志</button>
+      </aside>
+      <main class="admin-main">
+        <section id="sec-dashboard" class="admin-section"></section>
+        <section id="sec-courses" class="admin-section hidden"></section>
+        <section id="sec-activities" class="admin-section hidden"></section>
+        <section id="sec-gifts" class="admin-section hidden"></section>
+        <section id="sec-orders" class="admin-section hidden"></section>
+        <section id="sec-audit" class="admin-section hidden"></section>
+      </main>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+  <div id="modal-overlay" class="modal-overlay hidden">
+    <div class="modal" id="modal-box"></div>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>
