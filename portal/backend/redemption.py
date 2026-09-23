@@ -17,6 +17,11 @@ from . import db, logic
 MAX_STOCK = 1_000_000_000
 MAX_POINTS = 1_000_000
 
+# 兑换/库存写事务的有界死锁重试次数。InnoDB 死锁时会回滚整个事务（1213），
+# 而本模块每个事务体开头的幂等重放读 + 数据库唯一约束保证“重跑不会二次生效”，
+# 所以撞锁后整段重跑是安全的；超过上限则当作真实故障抛出。
+TX_RETRIES = 3
+
 
 class RequestIn(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
@@ -122,7 +127,7 @@ def redeem(gid: int, payload: RequestIn, emp_id: str):
         cur.execute("UPDATE redemptions SET response_json = %s WHERE id = %s",
                     (json.dumps(result, ensure_ascii=False), oid))
         return result
-    return db.run_tx(fn)
+    return db.run_tx(fn, retries=TX_RETRIES)
 
 
 def adjust_stock(gid: int, payload: StockIn, operator: str):
@@ -153,7 +158,7 @@ def adjust_stock(gid: int, payload: StockIn, operator: str):
                          "reason": payload.reason, "request_id": payload.request_id}, cur=cur)
         return {"ok": True, "record_id": rid, "stock": after}
     try:
-        return db.run_tx(fn)
+        return db.run_tx(fn, retries=TX_RETRIES)
     except pymysql.err.IntegrityError as exc:
         if not logic.is_duplicate(exc):
             raise
@@ -178,7 +183,7 @@ def _order_tx(oid, actor, callback, owner_only=False):
         if not order or (order["emp_id"], order["gift_id"]) != (initial["emp_id"], initial["gift_id"]):
             raise HTTPException(409, "订单已变化")
         return callback(cur, order, gift)
-    return db.run_tx(fn)
+    return db.run_tx(fn, retries=TX_RETRIES)
 
 
 def ship(oid: int, express: str, actor: str):

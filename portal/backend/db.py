@@ -4,9 +4,12 @@
 """
 from __future__ import annotations
 
+import logging
 import os
+import random
 import re
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -16,10 +19,17 @@ from dbutils.pooled_db import PooledDB
 
 from . import config
 
+logger = logging.getLogger("portal.db")
+
 _SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
 
 _pool: PooledDB | None = None
 _pool_lock = threading.RLock()
+
+# InnoDB 并发下可自愈的瞬态锁冲突：1213 死锁（引擎已回滚整个事务）、
+# 1205 锁等待超时。只有这两个码会被 run_tx 的有界重试吞掉；断连（20xx）、
+# 主键冲突（1062）、权限（1142）等都不在此列，依旧原样抛出。
+_RETRYABLE_MYSQL_ERRORS = (1213, 1205)
 
 
 def assert_test_database() -> None:
@@ -203,8 +213,39 @@ def insert(sql: str, args: Optional[tuple] = None) -> int:
         conn.close()
 
 
-def run_tx(fn: Callable[[pymysql.cursors.Cursor], Any], *, read_snapshot: bool = False) -> Any:
-    """在一个事务里执行 fn(cur)；异常整体回滚并抛出。"""
+def run_tx(fn: Callable[[pymysql.cursors.Cursor], Any], *, read_snapshot: bool = False,
+           retries: int = 0, retry_base_delay: float = 0.02,
+           retry_max_delay: float = 0.2) -> Any:
+    """在一个事务里执行 fn(cur)；异常整体回滚并抛出。
+
+    retries>0 时，对 InnoDB 的**瞬态锁冲突**做有界重试：死锁（1213，InnoDB 已自己
+    回滚了整个事务）与锁等待超时（1205）。这两类不是业务失败，而是“换个时机重跑
+    一遍就能成”的并发碰撞，生产惯例就是有限次重试。
+
+    重试的前提是 fn 可重入：每次重试都在一条**全新连接**上开**全新事务**（见 _run_once
+    里的显式 begin），要求重跑不会二次生效。本项目的写事务正是靠“数据库唯一约束 +
+    事务体开头的幂等重放读”兜住这一点，而不是靠内存标记。
+
+    业务用的 HTTPException、语法/约束错误、断连（20xx）等一律不重试，原样抛出。
+    """
+    attempt = 0
+    while True:
+        try:
+            return _run_once(fn, read_snapshot=read_snapshot)
+        except pymysql.err.OperationalError as exc:
+            code = exc.args[0] if exc.args else None
+            if attempt >= retries or code not in _RETRYABLE_MYSQL_ERRORS:
+                raise
+            attempt += 1
+            logger.warning("事务撞 InnoDB 瞬态锁冲突(code=%s)，第 %d/%d 次重试",
+                           code, attempt, retries)
+            delay = min(retry_base_delay * (2 ** (attempt - 1)), retry_max_delay)
+            # 加随机抖动，避免多个受害者同一时刻齐步重试再次对撞。
+            time.sleep(delay + random.uniform(0, delay))
+
+
+def _run_once(fn: Callable[[pymysql.cursors.Cursor], Any], *, read_snapshot: bool) -> Any:
+    """跑一次事务：整段成功提交，任何异常都回滚并抛出。run_tx 的重试循环靠它。"""
     conn = _connect()
     try:
         if read_snapshot:
