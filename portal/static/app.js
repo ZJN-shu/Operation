@@ -1253,7 +1253,7 @@
     loadAdminPoints();
   }
 
-  async function loadAdminPoints() {
+  async function loadAdminPoints(skipOpenStream) {
     const el = $('#sec-dashboard');
     el.innerHTML = dashTabBar() + '<div class="empty">加载中…</div>';
     try {
@@ -1274,7 +1274,8 @@
       pointsNewCount = 0;
       el.innerHTML = pointShell(d);
       renderPointTable();
-      openPointsStream();
+      // skipOpenStream：实时流的重连补拉已经在流里了，再开一条会递归套娃。
+      if (!skipOpenStream) openPointsStream();
     } catch (e) { el.innerHTML = dashTabBar() + '<div class="empty">加载失败：' + esc(e.message) + '</div>'; }
   }
 
@@ -1423,6 +1424,7 @@
   }
   async function runPointsStream(ctrl) {
     const auth = token;
+    const isReconnect = pointsStream.retry > 0;         // 断线重连（非首连）标记，下面会重置 retry
     try {
       const res = await fetch('/api/admin/points/stream', {
         method: 'GET',
@@ -1438,6 +1440,9 @@
       if (!res.ok || !res.body || !res.body.getReader) throw new Error('实时通道不可用（' + res.status + '）');
       pointsStream.retry = 0;                          // 连上了才重置退避
       refreshPointLiveBar();
+      // 断线期间服务端照常产生流水，这条连接没接上就会漏掉那一段。重连成功后
+      // 补拉一次当前页快照，用权威数据把缺口填上（普通增量帧不触发这次重拉）。
+      if (isReconnect) loadAdminPoints(true);          // 只补拉快照，不重开当前这条流
       await readPointsStream(res);
     } catch (e) {
       if (e && e.name === 'AbortError') return;        // 主动关闭，不重连

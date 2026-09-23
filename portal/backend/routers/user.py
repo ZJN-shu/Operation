@@ -189,7 +189,25 @@ def enroll(cid: int, user: dict = Depends(get_current_user)):
 
 
 @router.post("/api/user/courses/{cid}/complete")
-def complete(cid: int, user: dict = Depends(get_current_user)):
+def complete_course(cid: int, user: dict = Depends(get_current_user)):
+    """HTTP 入口：先过奖励资格门（必须已报名），再交给领域核心发奖。
+
+    资格判定只放在路由这一层，不塞进 complete —— complete 要保证的是幂等
+    （同一课程重复调用只发一次奖），而「没报名就不该白拿积分」是接口暴露
+    策略。两层混在一个函数里，就没法单独验证幂等了。
+    """
+    emp = user["emp_id"]
+    tp = db.query_one(
+        "SELECT enrolled FROM training_progress WHERE course_id = %s AND emp_id = %s",
+        (cid, emp),
+    )
+    if not tp or not tp["enrolled"]:
+        return {"ok": False, "reason": "not_enrolled"}
+    return complete(cid, user)
+
+
+def complete(cid: int, user: dict):
+    """领域核心：幂等地发放课程奖励（不查报名资格，由调用方分层把关）。"""
     emp = user["emp_id"]
 
     def fn(cur):
@@ -334,6 +352,10 @@ def mark_notifications_read(user: dict = Depends(get_current_user)):
 
 # ---------- 课程答题 ----------
 
+# 答题及格线（百分比）：完成课程先发的奖励，只有及格才保留，不及格则被撤销。
+QUIZ_PASS_PERCENT = 60
+
+
 class QuizAnswer(BaseModel):
     qid: int
     answer: str
@@ -385,4 +407,36 @@ def submit_quiz(cid: int, payload: QuizSubmit, user: dict = Depends(get_current_
         "INSERT INTO quiz_attempts (emp_id, course_id, score, total) VALUES (%s, %s, %s, %s)",
         (user["emp_id"], cid, score, len(questions)),
     )
-    return {"score": score, "total": len(questions), "results": results}
+    # 答题不及格 → 撤销之前“完成课程”已发放的奖励。
+    # 奖励资格不能只看“点没点完成”，还得看学习结果；否则挂完课刷分就能白拿。
+    total = len(questions)
+    if not total or score * 100 < total * QUIZ_PASS_PERCENT:
+        _revert_course_reward(cid, user["emp_id"])
+    return {"score": score, "total": total, "results": results}
+
+
+def _revert_course_reward(cid: int, emp_id: str) -> int:
+    """删掉该用户该课程的“完成课程”流水并同额回扣余额（幂等，无流水时返回 0）。
+
+    只改积分（流水 + 余额），不动 training_progress：completed 标记反映的是
+    “学过”，撤销只针对“白拿的奖励”。两者分开才不会把用户的答题入口一并遮掉。
+    """
+
+    def fn(cur):
+        cur.execute(
+            "SELECT id, points FROM point_records "
+            "WHERE emp_id = %s AND ref_type = 'course' AND ref_id = %s",
+            (emp_id, cid),
+        )
+        row = cur.fetchone()
+        if not row:
+            return 0
+        cur.execute("DELETE FROM point_records WHERE id = %s", (row["id"],))
+        # 发放时是 balance + points，撤销就是反向同额减回（points 为正数时减）。
+        cur.execute(
+            "UPDATE point_accounts SET balance = balance - %s WHERE emp_id = %s",
+            (row["points"], emp_id),
+        )
+        return row["points"]
+
+    return db.run_tx(fn)

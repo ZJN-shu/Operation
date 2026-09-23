@@ -741,6 +741,11 @@ async def stream_points(request: Request, user: dict = Depends(require_admin)):
                         break
                     yield ": ping\n\n"
                     continue
+                # 只在心跳时复查鉴权不够：来帧持续不断时 wait_for 永远不超时，
+                # 已撤销的会话就能靠一条不停的流水一直推送下去。每帧外发前再查一次。
+                if not auth.resolve_session(token):
+                    yield "event: bye\ndata: {}\n\n"
+                    break
                 yield "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
                 if payload.get("type") == "dropped":
                     # 队列满说明客户端读得比生产慢，中间已经丢帧了。

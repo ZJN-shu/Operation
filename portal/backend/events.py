@@ -146,19 +146,42 @@ def _emit(payload: dict) -> None:
 
 
 def _poll_once(watermark: int) -> int:
-    """扫一次增量，返回新的水位。"""
-    rows = db.query(_SELECT, (logic.ADMIN_REF_TYPES, watermark - _TRAILING_WINDOW, _BATCH))
+    """扫一次增量，返回新的水位（尾窗重扫 + gap-aware 推进）。
+
+    两件分开的事：
+
+    1) **发现**（会不会漏）：扫描下界仍回退 _TRAILING_WINDOW 个 id 重扫，配合
+       _published 去重不会重推。这样即使晚提交的那条 id 落在当前水位下方（自增
+       序列与其他事务交错、回滚保留的空洞都会造成这种偏斜），只要在水位下方一个
+       尾窗内，依然能被重新扫到并补发。
+
+    2) **推进**（水位会不会越过还没落地的洞）：水位只在“当前水位上方 id 连续”时
+       才往前推，撞到空洞（那条更小的 id 还没提交）就停在洞下方。这保证尾窗不
+       会固定地一路向前滑动、把一个长事务拖超过 50 个 id 后才提交的流水永远弄丢。
+
+    代价：回滚会在自增序列里留下**永久空洞**，水位会卡在洞下方反复重扫。用
+    _BATCH 兑底：水位一轮没动、且洞上方已堆近一个批次时，当作永久空洞直接越过，避免停滞。
+    """
+    lower = watermark - _TRAILING_WINDOW
+    rows = db.query(_SELECT, (logic.ADMIN_REF_TYPES, lower, _BATCH))
     if not rows:
         return watermark
-    newest = watermark
+    present = set()
+    highest = watermark
     for row in rows:
         rid = row["id"]
-        if rid > newest:
-            newest = rid
-        if rid in _published:
-            continue
-        _published.append(rid)
-        _emit(_row_payload(row))
+        highest = rid
+        present.add(rid)
+        if rid not in _published:
+            _published.append(rid)
+            _emit(_row_payload(row))
+    # 水位只沿“水位上方连续已提交”的 id 推进；撞到空洞就停下等下一轮补扫。
+    newest = watermark
+    while (newest + 1) in present:
+        newest += 1
+    if newest == watermark and (highest - watermark) >= _BATCH - 1:
+        # 水位纹丝不动且一个批次快被洞上方占满：当作回滚留下的永久空洞，越过它以免停滞。
+        newest = highest
     return newest
 
 
