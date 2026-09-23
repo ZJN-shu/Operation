@@ -1,8 +1,8 @@
-# IT 运营门户（本地版）
+# IT 运营门户
 
-公司运营网站的本地复刻：**FastAPI（Python） + MySQL + 单页 HTML/JS**，标签用 emoji 表示。
-在原项目基础上做了简化：去掉了 Dash 平台 SQL 代理 / 网关 Token / OSS，改为直连本机 MySQL，并用
-**pymysql 真参数化** + **积分账户表 + 事务**修掉了原项目「手写 SQL 插值注入」和「兑换无事务」两个硬伤。
+企业运营门户：**FastAPI（Python） + MySQL + 单页 HTML/JS**，界面标签用 emoji 表示。
+后端用 **pymysql 真参数化** 直连 MySQL，积分、库存、订单的写入统一走**账户表 + 事务**，
+保证兑换链路在并发与重试下的一致性。
 
 ## 功能
 
@@ -162,8 +162,8 @@ announcement/redeem`）的 `ref_id` 是业务对象 id；人工流水（`grant/d
 
 ## 搜索：倒排索引（`backend/search_index.py`）
 
-原来 `/api/search` 是 `LIKE '%关键词%'`，两个问题：**用不上索引**（前置通配符必然全表扫），
-而且关键词直接进 LIKE 模式串（`%` `_` 要转义，漏一个就是通配符注入）。现在换成倒排索引：
+`/api/search` 没有用 `LIKE '%关键词%'`——前置通配符用不上索引（必然全表扫），
+而且关键词直接进 LIKE 模式串（`%` `_` 要转义，漏一个就是通配符注入）。这里改用倒排索引：
 
 - **索引表 `search_keywords(keyword, doc_type, doc_id, weight)`**，唯一键 `uk_kw_doc` +
   查询索引 `idx_kw(keyword, doc_type)`，`keyword IN (...)` 走索引，不需要扫描正文。
