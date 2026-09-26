@@ -154,23 +154,37 @@
     const labels = { pending: '⏳ 待发货', shipped: '🚚 已发货', cancelled: '已取消并退款', refunded: '已退货退款' };
     return `<span class="tag ${status === 'pending' ? 'tag-amber' : 'tag-gray'}">${esc(labels[status] || status)}</span>`;
   }
-  async function cancelOrder(id, admin) {
-    const reason = prompt('取消后将返还积分并恢复库存，请填写原因：');
-    if (!reason || !reason.trim()) return;
+  // 取消/退货/发货的输入统一走页内 modal，不用原生 prompt/confirm：
+  // 内嵌 webview 里原生弹窗会被禁用并返回 null，处理函数就在发请求前静默退出。
+  function cancelOrder(id, admin) {
+    openModal(`<h2>取消订单</h2>
+      <p>取消后返还积分并恢复库存${admin ? '' : '（仅未发货订单可取消）'}。请填写取消原因。</p>
+      <div class="form-field"><label>取消原因</label><input id="cancel-reason" maxlength="100" /></div>
+      <div class="form-actions"><button class="btn-primary" onclick="App.submitCancel(${id}, ${admin})">确认取消</button><button class="btn-outline" onclick="App.closeModal()">返回</button></div>`);
+  }
+  async function submitCancel(id, admin) {
+    const reason = $('#cancel-reason').value.trim();
+    if (!reason) { toast('请填写取消原因', 'error'); return; }
     try {
       await api(`/api/${admin ? 'admin' : 'user'}/orders/${id}/cancel`, { method: 'POST', body: { reason } });
       toast('订单已取消并退款', 'success');
+      closeModal();
       if (admin) await loadAdminOrders();
       else await refreshAll();
     } catch (e) { toast(e.message, 'error'); }
   }
-  async function refundOrder(id) {
-    if (!confirm('是否已收到退货并确认可重新入库？确认后返还积分和库存。')) return;
-    const reason = prompt('请填写退货退款原因：');
-    if (!reason || !reason.trim()) return;
+  function refundOrder(id) {
+    openModal(`<h2>退货退款</h2>
+      <p>请确认已收到退货并可重新入库；确认后返还积分和库存。请填写退货原因。</p>
+      <div class="form-field"><label>退货原因</label><input id="refund-reason" maxlength="100" /></div>
+      <div class="form-actions"><button class="btn-primary" onclick="App.submitRefund(${id})">确认退款</button><button class="btn-outline" onclick="App.closeModal()">返回</button></div>`);
+  }
+  async function submitRefund(id) {
+    const reason = $('#refund-reason').value.trim();
+    if (!reason) { toast('请填写退货原因', 'error'); return; }
     try {
       await api(`/api/admin/orders/${id}/refund`, { method: 'POST', body: { reason, returned: true } });
-      toast('退货退款已完成', 'success'); await loadAdminOrders();
+      toast('退货退款已完成', 'success'); closeModal(); await loadAdminOrders();
     } catch (e) { toast(e.message, 'error'); }
   }
 
@@ -1204,12 +1218,18 @@
       el.innerHTML = html;
     } catch (e) { el.innerHTML = '<div class="empty">加载失败</div>'; }
   }
-  async function shipOrder(id) {
-    const express = prompt('请输入物流单号：');
-    if (!express) return;
+  function shipOrder(id) {
+    openModal(`<h2>📦 发货</h2>
+      <p>为订单 #${id} 填写物流单号；发货后不能再直接取消，只能走退货退款。</p>
+      <div class="form-field"><label>物流单号</label><input id="ship-express" maxlength="128" placeholder="如 SF1234567890" /></div>
+      <div class="form-actions"><button class="btn-primary" onclick="App.submitShip(${id})">确认发货</button><button class="btn-outline" onclick="App.closeModal()">取消</button></div>`);
+  }
+  async function submitShip(id) {
+    const express = $('#ship-express').value.trim();
+    if (!express) { toast('请输入物流单号', 'error'); return; }
     try {
       await api('/api/admin/orders/' + id + '/ship', { method: 'POST', body: { express } });
-      toast('已发货', 'success'); loadAdminOrders();
+      toast('已发货', 'success'); closeModal(); await loadAdminOrders();
     } catch (e) { toast(e.message, 'error'); }
   }
 
@@ -1839,13 +1859,13 @@
     completeCourse: (id) => doAction(`/api/user/courses/${id}/complete`, '完成课程，积分已到账'),
     participate: (id) => doAction(`/api/user/activities/${id}/participate`, '参与成功，积分已到账'),
     readAnnouncement: (id) => doAction(`/api/user/announcements/${id}/read`, '阅读成功，积分已到账'),
-    redeemGift, confirmRedeem, cancelOrder, refundOrder, reconcileOrders, openStockForm, saveStock,
+    redeemGift, confirmRedeem, cancelOrder, submitCancel, refundOrder, submitRefund, reconcileOrders, openStockForm, saveStock,
     goSearchResult,
     onCourseSearch, clearCourseSearch, onGiftSort,
     openCourseForm, saveCourse,
     openActivityForm, saveActivity, saveCarousel,
     openGiftForm, saveGift,
-    toggleStatus, shipOrder, closeModal, goPage,
+    toggleStatus, shipOrder, submitShip, closeModal, goPage,
     openCourseDetail, openGiftDetail, openAnnouncementDetail, openActivityDetail,
     enrollCourseDetail: (id) => { closeModal(); return doAction(`/api/user/courses/${id}/enroll`, '报名成功'); },
     completeCourseDetail: (id) => { closeModal(); return doAction(`/api/user/courses/${id}/complete`, '完成课程，积分已到账'); },
