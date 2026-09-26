@@ -8,9 +8,12 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# 说明：本流水线刻意保留项目当前已知的 5 个失败用例（后端 4 / 前端 1，
-# 分别对应课程奖励资格、SSE 会话撤销、SSE 晚提交、断线重连补拉）。
-# 这里不用 continue-on-error / skip 去掩盖它们——红就是红，作为“修复前不放行”的门禁。
+# 说明：本流水线曾刻意保留 5 个已知失败用例（后端 4 / 前端 1，分别对应
+# 课程奖励资格、SSE 会话撤销、SSE 晚提交、断线重连补拉），不用 continue-on-error
+# 掩盖，作为"修复前不放行"的门禁。
+# 这 5 处已随后续提交修复：完成课程先校验报名资格、SSE 每帧外发前复查会话、
+# 水位 gap-aware 推进 + 批次越洞、断线重连补拉快照。本地实测后端 100 项、
+# 前端 107 断言全通过，门禁恢复为"全绿才放行"。
 
 jobs:
   lint:
@@ -37,7 +40,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - name: 运行前端断言（含 1 个已知失败，故意让本 job 变红）
         run: node portal/tests/test_frontend.js
 
   backend:
@@ -66,7 +68,7 @@ jobs:
           echo "PORTAL_TEST_MYSQLD=$BIN" >> "$GITHUB_ENV"
           echo "使用 mysqld: $BIN"
 
-      - name: 运行数据库集成测试（含 4 个已知失败，故意让本 job 变红）
+      - name: 运行数据库集成测试（真实 MySQL）
         run: python -m portal.tests.run_mysql
 
       # 兜底说明：若上面的 mysqld 因 runner 权限 / AppArmor 起不来，
