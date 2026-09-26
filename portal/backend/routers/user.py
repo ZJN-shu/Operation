@@ -176,9 +176,9 @@ def enroll(cid: int, user: dict = Depends(get_current_user)):
         if cur.fetchone():
             return {"ok": False, "reason": "already_enrolled"}
         cur.execute(
-            "INSERT INTO training_progress (course_id, emp_id, enrolled, progress, completed) "
-            "VALUES (%s, %s, 1, 0, 0)",
-            (cid, emp),
+            "INSERT INTO training_progress (course_id, emp_id, session_id, enrolled, progress, completed) "
+            "VALUES (%s, %s, %s, 1, 0, 0)",
+            (cid, emp, user.get("session_id", "")),
         )
         return {"ok": True}
 
@@ -229,9 +229,9 @@ def complete(cid: int, user: dict):
             )
         else:
             cur.execute(
-                "INSERT INTO training_progress (course_id, emp_id, enrolled, progress, completed) "
-                "VALUES (%s, %s, 1, 100, 1)",
-                (cid, emp),
+                "INSERT INTO training_progress (course_id, emp_id, session_id, enrolled, progress, completed) "
+                "VALUES (%s, %s, %s, 1, 100, 1)",
+                (cid, emp, user.get("session_id", "")),
             )
         logic.add_points(cur, emp, c["points"], "完成课程", "course", cid)
         return {"ok": True, "points": c["points"]}
@@ -298,7 +298,7 @@ def read_announcement(aid: int, user: dict = Depends(get_current_user)):
 
 @router.post("/api/user/gifts/{gid}/redeem")
 def redeem(gid: int, payload: redemption.RequestIn, user: dict = Depends(get_current_user)):
-    return redemption.redeem(gid, payload, user["emp_id"])
+    return redemption.redeem(gid, payload, user["emp_id"], user.get("session_id", ""))
 
 
 @router.post("/api/user/orders/{oid}/cancel")

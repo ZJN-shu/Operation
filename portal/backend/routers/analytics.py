@@ -220,6 +220,10 @@ def dashboard(_: dict = Depends(require_admin)):
         "GROUP BY g.id, g.name, g.icon ORDER BY views DESC LIMIT 5"
     )
 
+    # 会话漏斗：与上面的人数口径并列，回答「同一次访问里能不能走到最后一步」。
+    # 空串会话的排除规则只在 metrics 里有一份，这里不自己写聚合 SQL。
+    session_funnel = metrics.session_funnel(7)
+
     return {
         "overview": overview,
         "daily_points": daily_points,
@@ -234,4 +238,5 @@ def dashboard(_: dict = Depends(require_admin)):
         "shipping": shipping,
         "top_course_views": top_course_views,
         "top_gift_views": top_gift_views,
+        "session_funnel": session_funnel,
     }

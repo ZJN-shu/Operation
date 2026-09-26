@@ -129,6 +129,9 @@ CREATE TABLE IF NOT EXISTS redemptions (
     id          INT         NOT NULL AUTO_INCREMENT,
     gift_id     INT         NOT NULL,
     emp_id      VARCHAR(32) NOT NULL,
+    -- 下单时的会话：把「浏览了哪个礼品」和「最终兑换」串到同一次访问上，会话漏斗的最后一环靠它归因。
+    -- 允许为空串：老订单没有会话，口径里一律排除（见 metrics.session_funnel）。
+    session_id  VARCHAR(64) DEFAULT '',
     points_cost INT         NOT NULL,
     status      VARCHAR(16) NOT NULL DEFAULT 'pending',  -- pending=待发货 shipped=已发货 cancelled=已取消 refunded=已退货退款
     express     VARCHAR(128) DEFAULT '',
@@ -144,7 +147,8 @@ CREATE TABLE IF NOT EXISTS redemptions (
     UNIQUE KEY uk_redeem_request (emp_id, request_id),
     KEY idx_emp (emp_id),
     KEY idx_gift (gift_id),
-    KEY idx_status (status)
+    KEY idx_status (status),
+    KEY idx_session (session_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- 库存流水：baseline 为接入时的库存快照，不伪造接入前的历史出入库。
@@ -179,12 +183,16 @@ CREATE TABLE IF NOT EXISTS training_progress (
     id        INT         NOT NULL AUTO_INCREMENT,
     course_id INT         NOT NULL,
     emp_id    VARCHAR(32) NOT NULL,
+    -- 报名时的会话（同 redemptions.session_id）：课程浏览→报名的会话归因靠它。
+    -- 只在 INSERT 时写入，完成课程不改 —— 语义是「这条进度首次产生于哪个会话」。
+    session_id VARCHAR(64) DEFAULT '',
     enrolled  TINYINT     NOT NULL DEFAULT 0,
     progress  INT         NOT NULL DEFAULT 0,
     completed TINYINT     NOT NULL DEFAULT 0,
     PRIMARY KEY (id),
     UNIQUE KEY uk (course_id, emp_id),
-    KEY idx_emp (emp_id)
+    KEY idx_emp (emp_id),
+    KEY idx_session (session_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS activity_participants (

@@ -94,6 +94,30 @@ METRIC_DEFS: tuple[dict, ...] = (
         "window": "全周期",
         "decision": "履约体验的硬指标",
     },
+    {
+        "key": "session_depth", "name": "单会话访问深度",
+        "definition": "一个会话内平均产生多少个事件，衡量「进来之后逛了多少」",
+        "formula": "COUNT(事件) / COUNT(会话)，按 session_id 分组",
+        "denominator": "窗口内有过事件的会话数", "dedup": "按 session_id 分组，不按人去重",
+        "window": "近 N 个自然日",
+        "decision": "深度低=进来就看一眼就走，指向首页/导航问题，而不是内容问题",
+    },
+    {
+        "key": "session_gift_conversion", "name": "单会话兑换转化",
+        "definition": "浏览过礼品详情的会话中，同一会话内最终下单兑换的比例",
+        "formula": "同会话发生兑换的会话数 / 浏览礼品的会话数 × 100%",
+        "denominator": "窗口内产生过 gift_view 的会话数", "dedup": "会话级去重（session_id）",
+        "window": "分母限近 N 日；分子不限时间——同一次会话可能跨天，兑换晚于浏览仍算这次访问的成果",
+        "decision": "和「人数转化率」对照看：会话转化低而人数转化高，说明用户要来好几次才肯下单",
+    },
+    {
+        "key": "session_course_conversion", "name": "单会话报名转化",
+        "definition": "浏览过课程详情的会话中，同一会话内完成报名的比例",
+        "formula": "同会话报名的会话数 / 浏览课程的会话数 × 100%",
+        "denominator": "窗口内产生过 course_view 的会话数", "dedup": "会话级去重（session_id）",
+        "window": "分母限近 N 日；分子不限时间（同 session_gift_conversion）",
+        "decision": "衡量课程详情页当场说服力的硬指标",
+    },
 )
 
 
@@ -220,3 +244,80 @@ def daily_points(days: int = 7) -> list[dict]:
         "GROUP BY DATE(created_at) ORDER BY d ASC",
         (days - 1, _CORRECTION_REF_TYPES),
     )
+
+
+# ---------- 会话维度口径 ----------
+#
+# 会话（session_id）是比「人」更细的一层：同一个人今天来三次算三个会话，
+# 人数口径看不出「要来几次才肯下单」，会话口径看得出。
+#
+# 一条硬规则：session_id 为空串的行一律排除。空串来自加列之前的历史订单与
+# 老埋点，它们并不是「同一个会话」—— 不排除就会被聚成一个横跨所有人的
+# 超级会话，漏斗数字彻底失真。所以每个函数里都有 session_id <> ''。
+
+
+def _window_days(days: int) -> int:
+    """把「近 N 个自然日（含今日）」换算成 DATE_SUB 的间隔天数。"""
+    return max(days - 1, 0)
+
+
+def session_depth(days: int = 7) -> tuple[float, int]:
+    """单会话访问深度：返回 (平均事件数, 会话数)。"""
+    row = db.query_one(
+        "SELECT COALESCE(AVG(c), 0) AS depth, COUNT(*) AS sessions FROM ("
+        "SELECT session_id, COUNT(*) AS c FROM user_access_logs "
+        "WHERE session_id <> '' "
+        "AND accessed_at >= DATE_SUB(CURDATE(), INTERVAL %s DAY) "
+        "GROUP BY session_id) t",
+        (_window_days(days),))
+    if not row:
+        return 0.0, 0
+    return round(float(row["depth"]), 2), int(row["sessions"])
+
+
+def session_gift_funnel(days: int = 7) -> tuple[int, int, float]:
+    """浏览礼品 → 同一会话内兑换。返回 (浏览会话数, 兑换会话数, 转化%)。
+
+    分子不限制兑换发生的时间：同一次会话可能跨天，兑换晚于浏览仍算这次访问的成果。
+    分母限制在窗口内，所以分子恒为分母的子集，不会出现转化率 > 100%。
+    """
+    row = db.query_one(
+        "SELECT COUNT(DISTINCT v.session_id) AS viewed, "
+        "COUNT(DISTINCT r.session_id) AS redeemed "
+        "FROM user_access_logs v "
+        "LEFT JOIN redemptions r ON r.session_id <> '' AND r.session_id = v.session_id "
+        "WHERE v.session_id <> '' AND v.event_type = 'gift_view' AND v.ref_type = 'gift' "
+        "AND v.accessed_at >= DATE_SUB(CURDATE(), INTERVAL %s DAY)",
+        (_window_days(days),))
+    viewed = int(row["viewed"]) if row else 0
+    redeemed = int(row["redeemed"]) if row else 0
+    return viewed, redeemed, pct(redeemed, viewed)
+
+
+def session_course_funnel(days: int = 7) -> tuple[int, int, float]:
+    """浏览课程 → 同一会话内报名。返回 (浏览会话数, 报名会话数, 转化%)。"""
+    row = db.query_one(
+        "SELECT COUNT(DISTINCT v.session_id) AS viewed, "
+        "COUNT(DISTINCT tp.session_id) AS enrolled "
+        "FROM user_access_logs v "
+        "LEFT JOIN training_progress tp ON tp.session_id <> '' AND tp.session_id = v.session_id "
+        "WHERE v.session_id <> '' AND v.event_type = 'course_view' AND v.ref_type = 'course' "
+        "AND v.accessed_at >= DATE_SUB(CURDATE(), INTERVAL %s DAY)",
+        (_window_days(days),))
+    viewed = int(row["viewed"]) if row else 0
+    enrolled = int(row["enrolled"]) if row else 0
+    return viewed, enrolled, pct(enrolled, viewed)
+
+
+def session_funnel(days: int = 7) -> dict:
+    """会话漏斗汇总。口径说明书见 METRIC_DEFS 里的 session_* 三条。"""
+    gift_viewed, gift_done, gift_rate = session_gift_funnel(days)
+    course_viewed, course_done, course_rate = session_course_funnel(days)
+    depth, sessions = session_depth(days)
+    return {
+        "window_days": days,
+        "sessions": sessions,
+        "depth": depth,
+        "gift": {"viewed": gift_viewed, "converted": gift_done, "rate": gift_rate},
+        "course": {"viewed": course_viewed, "converted": course_done, "rate": course_rate},
+    }

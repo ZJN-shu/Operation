@@ -679,6 +679,30 @@ const viewOf = (env) => {
     console.log(`     验收数据：上架 540 门，搜索命中 ${ids.length} 门，其中跨分类 ${cross} 门`);
   }
 
+  console.log('\n⑱ 会话漏斗：数字由服务端算好，前端只渲染、不自己折算');
+  {
+    // 空态：老库还没有 session_funnel 时不能编造数字，也不能崩
+    const empty = makeEnv({ storage: { ops_token: 'tok', ops_view: 'admin' }, me: ADMIN_USER });
+    await tick(150);
+    check(/🧭 会话漏斗/.test(empty.get('#sec-dashboard').innerHTML), '看板渲染会话漏斗卡片');
+    check(/暂无会话数据/.test(empty.get('#sec-dashboard').innerHTML), '无会话数据时显示空态，不编造数字');
+
+    // 有数据：直接渲染服务端给的会话数与转化率，前端不做二次计算
+    const funnel = { window_days: 7, sessions: 12, depth: 3.5,
+      gift: { viewed: 10, converted: 2, rate: 20.0 },
+      course: { viewed: 8, converted: 4, rate: 50.0 } };
+    const env = makeEnv({ storage: { ops_token: 'tok', ops_view: 'admin' }, me: ADMIN_USER,
+      request: (p) => p === '/api/admin/dashboard'
+        ? response({ ...EMPTY_DASHBOARD, session_funnel: funnel }) : undefined });
+    await tick(150);
+    const html = env.get('#sec-dashboard').innerHTML;
+    check(/12<\/b> 个会话/.test(html), '渲染总会话数');
+    check(/3\.5/.test(html), '渲染平均访问深度');
+    check(/礼品浏览 → 兑换[\s\S]*10<\/b> → <b>2<\/b> 个会话 · 转化 <b>20%/.test(html),
+      '礼品会话漏斗：10 个浏览会话 → 2 个兑换会话 · 20%');
+    check(/同一 session_id 内走到最后一步才算转化/.test(html), '卡片上写清口径，避免被当成人数口径');
+  }
+
   console.log(`\n${pass} 通过 / ${fail} 失败`);
   process.exit(fail ? 1 : 0);
 })();

@@ -87,7 +87,12 @@ def _stock_record(cur, gid, delta, after, kind, ref_id, operator, request_id=Non
     return cur.lastrowid
 
 
-def redeem(gid: int, payload: RequestIn, emp_id: str):
+def redeem(gid: int, payload: RequestIn, emp_id: str, session_id: str = ""):
+    """兑换。session_id 记下单时的会话，供「浏览→兑换」会话漏斗归因。
+
+    默认空串：老调用方（含测试）拿不到会话时写入空串，口径里一律排除，
+    不会把历史订单误并进同一个会话。
+    """
     def fn(cur):
         balance = _account(cur, emp_id)
         # 同用户同请求串行化后先读旧结果，库存、价格和上架状态变化不影响重放。
@@ -110,8 +115,8 @@ def redeem(gid: int, payload: RequestIn, emp_id: str):
         cur.execute("UPDATE gifts SET stock = stock - 1 WHERE id = %s AND stock > 0", (gid,))
         if cur.rowcount != 1:
             raise HTTPException(409, "库存已变化，请重试")
-        cur.execute("INSERT INTO redemptions (gift_id, emp_id, points_cost, request_id) "
-                    "VALUES (%s,%s,%s,%s)", (gid, emp_id, cost, payload.request_id))
+        cur.execute("INSERT INTO redemptions (gift_id, emp_id, session_id, points_cost, request_id) "
+                    "VALUES (%s,%s,%s,%s,%s)", (gid, emp_id, session_id, cost, payload.request_id))
         oid = cur.lastrowid
         logic.add_points(cur, emp_id, -cost, "兑换礼品", "redeem", oid)
         _stock_record(cur, gid, -1, gift["stock"] - 1, "redeem", oid, emp_id)

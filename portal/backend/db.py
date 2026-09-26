@@ -142,6 +142,12 @@ _MIGRATIONS: tuple[str, ...] = (
     "ALTER TABLE redemptions ADD COLUMN refund_reason VARCHAR(100) DEFAULT ''",
     "ALTER TABLE redemptions ADD COLUMN refund_operator VARCHAR(32) DEFAULT ''",
     "ALTER TABLE redemptions ADD UNIQUE KEY uk_redeem_request (emp_id, request_id)",
+    # 会话归因：老订单/老进度补列即可，默认空串代表「无从归因」，口径里一律排除，
+    # 不需要回填 —— 空串若被当成同一个会话，会把漏斗聚成一个超级会话算错。
+    "ALTER TABLE redemptions ADD COLUMN session_id VARCHAR(64) DEFAULT '' AFTER emp_id",
+    "ALTER TABLE training_progress ADD COLUMN session_id VARCHAR(64) DEFAULT '' AFTER emp_id",
+    "ALTER TABLE redemptions ADD KEY idx_session (session_id)",
+    "ALTER TABLE training_progress ADD KEY idx_session (session_id)",
 )
 
 # 1060 = Duplicate column name，1061 = Duplicate key name

@@ -877,6 +877,8 @@
 
       html += '<div class="card"><h2>🔻 转化漏斗</h2>' + renderFunnel(d.funnel, d.rates) + '</div>';
 
+      html += '<div class="card"><h2>🧭 会话漏斗</h2>' + renderSessionFunnel(d.session_funnel) + '</div>';
+
       html += '<div class="card"><h2>🚚 履约时效</h2><div class="insight-line">平均发货时长 <b>' + (d.shipping ? d.shipping.avg_hours : 0) + '</b> 小时 · 已发货 <b>' + (d.shipping ? d.shipping.c : 0) + '</b> 单 · 待发货 <b>' + o.pending_orders + '</b> 单</div></div>';
 
       html += '<div class="grid grid-2">';
@@ -930,6 +932,16 @@
         <div class="fr-val">${val}</div>
         <div class="fr-rate">${rate}</div>
       </div>`).join('');
+  }
+  // 会话漏斗：和上面的「人数漏斗」并列，回答「同一次访问里能不能走到最后一步」。
+  // 数字一律由服务端算好（空串会话排除等口径只在 metrics 里有一份），这里只负责渲染。
+  function renderSessionFunnel(sf) {
+    if (!sf) return '<div class="empty">暂无会话数据</div>';
+    const row = (label, v) => `<div class="insight-line">${label} <b>${v.viewed}</b> → <b>${v.converted}</b> 个会话 · 转化 <b>${v.rate}%</b></div>`;
+    return `<div class="insight-line">近 ${sf.window_days} 天共 <b>${sf.sessions}</b> 个会话 · 平均访问深度 <b>${sf.depth}</b> 次事件/会话</div>` +
+      row('📚 课程浏览 → 报名', sf.course) +
+      row('🎁 礼品浏览 → 兑换', sf.gift) +
+      '<div class="insight-line" style="font-size:12px;color:#6b7280">口径：同一 session_id 内走到最后一步才算转化；加列前的历史数据无会话，不进口径</div>';
   }
   function renderKeywords(list) {
     if (!list || !list.length) return '<div class="empty">暂无搜索数据</div>';
