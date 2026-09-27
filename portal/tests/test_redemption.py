@@ -181,6 +181,8 @@ class TestRedemption(unittest.TestCase):
     def tearDown(self):
         db.assert_test_database()
         for emp in self.emps:
+            # 通知改走发件箱后，收件人以 'user:<emp_id>' 形式登记，按此清理。
+            db.execute("DELETE FROM notification_outbox WHERE audience=%s", (f"user:{emp}",))
             for table, field in (("notifications", "emp_id"), ("audit_logs", "emp_id"),
                                  ("point_records", "emp_id"), ("point_ops", "target_emp_id"),
                                  ("point_accounts", "emp_id"), ("redemptions", "emp_id"), ("users", "emp_id")):
@@ -189,6 +191,7 @@ class TestRedemption(unittest.TestCase):
             db.execute("DELETE FROM gift_stock_records WHERE gift_id=%s", (gid,))
             db.execute("DELETE FROM search_keywords WHERE doc_type='gift' AND doc_id=%s", (gid,))
             db.execute("DELETE FROM notifications WHERE ntype='low_stock' AND ref_id=%s", (gid,))
+            db.execute("DELETE FROM notification_outbox WHERE ref_type='gift' AND ref_id=%s", (gid,))
             db.execute("DELETE FROM gifts WHERE id=%s", (gid,))
 
     def make_user(self, balance=100, role="user"):
@@ -242,7 +245,10 @@ class TestRedemption(unittest.TestCase):
         return {t: db.query(f"SELECT * FROM {t} ORDER BY {key}") for t, key in (
             ("users", "emp_id"), ("point_accounts", "emp_id"), ("point_records", "id"),
             ("redemptions", "id"), ("gifts", "id"), ("gift_stock_records", "id"),
-            ("audit_logs", "id"), ("notifications", "id"), ("point_ops", "id"))}
+            ("audit_logs", "id"), ("notifications", "id"), ("point_ops", "id"),
+            # 通知发件箱也要进快照：它和业务写入同事务，回滚时那些行必须一起消失 ——
+            # 「只有提交成功才发通知」就是靠这条断言钉住的。
+            ("notification_outbox", "id"))}
 
     def test_多人抢最后一件仅一单且库存非负(self):
         gid = self.make_gift(stock=1, baseline=False)

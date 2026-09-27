@@ -168,27 +168,5 @@ def log_event_for(user: dict, event_type: str, ref_type: str = "", ref_id: int |
 
 LOW_STOCK_THRESHOLD = 3
 
-
-def notify(emp_id: str, title: str, content: str, ntype: str = "system",
-           ref_id: int | None = None, cur=None) -> None:
-    """站内信通知：发给单个用户。"""
-    sql = ("INSERT INTO notifications (emp_id, title, content, ntype, ref_id) "
-           "VALUES (%s, %s, %s, %s, %s)")
-    args = (emp_id, title, content[:500], ntype, ref_id)
-    if cur is not None:
-        cur.execute(sql, args)
-    else:
-        db.execute(sql, args)
-
-
-def notify_admins(title: str, content: str, ntype: str = "system", ref_id: int | None = None,
-                  cur=None) -> None:
-    """站内信通知：发给商城运营 + 超级管理员（处理礼品/库存相关角色）。"""
-    sql = "SELECT emp_id FROM users WHERE role IN ('super_admin', 'shop_admin')"
-    if cur is not None:
-        cur.execute(sql)
-        admins = cur.fetchall()
-    else:
-        admins = db.query(sql)
-    for a in admins:
-        notify(a["emp_id"], title, content, ntype, ref_id, cur=cur)
+# 通知相关的职责已迁到 notifier.py：事务内只写发件箱，投递在事务外异步完成。
+# 这里保留阈值常量是因为它是业务规则（库存跨过 3 才告警一次），不是投递细节。

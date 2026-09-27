@@ -148,6 +148,10 @@ _MIGRATIONS: tuple[str, ...] = (
     "ALTER TABLE training_progress ADD COLUMN session_id VARCHAR(64) DEFAULT '' AFTER emp_id",
     "ALTER TABLE redemptions ADD KEY idx_session (session_id)",
     "ALTER TABLE training_progress ADD KEY idx_session (session_id)",
+    # 通知改走发件箱后，投递结果要能反查来源并保证重复投递不落库。
+    # notification_outbox 本身由 schema.sql 的 CREATE IF NOT EXISTS 建，老库启动即补齐。
+    "ALTER TABLE notifications ADD COLUMN outbox_id INT DEFAULT NULL AFTER ref_id",
+    "ALTER TABLE notifications ADD UNIQUE KEY uk_outbox (outbox_id, emp_id)",
 )
 
 # 1060 = Duplicate column name，1061 = Duplicate key name

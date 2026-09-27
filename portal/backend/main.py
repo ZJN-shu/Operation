@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import auth, config, db, events, logic, search_index, seed
+from . import auth, config, db, events, logic, notifier, search_index, seed
 from .routers import admin, analytics, user
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
@@ -45,7 +45,11 @@ async def lifespan(app: FastAPI):
     # 否则启动瞬间会把演示流水全推给第一个连上来的管理端。
     events.bind_loop(asyncio.get_running_loop())
     events.start_poller()
+    # 通知投递：业务事务只写发件箱，这里启动事务外的投递线程。
+    # 必须在 seed 之后 —— 否则会把演示数据带的通知当成新事件推一遍。
+    notifier.start_dispatcher()
     yield
+    notifier.stop_dispatcher()
     events.stop_poller()
 
 

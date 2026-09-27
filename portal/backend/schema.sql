@@ -276,11 +276,44 @@ CREATE TABLE IF NOT EXISTS notifications (
     content    VARCHAR(500) DEFAULT '',
     ntype      VARCHAR(32)  DEFAULT 'system',  -- redeem / ship / refund / low_stock / system
     ref_id     INT          DEFAULT NULL,
+    -- 来源发件箱行号。与 uk_outbox 一起构成投递幂等：投递器是「至少一次」，
+    -- 重复投递撞这条唯一键变成空操作，而不是靠内存标记去重。
+    -- 可空是为了兼容历史行：MySQL 唯一索引允许多个 NULL，老数据不受影响。
+    outbox_id  INT          DEFAULT NULL,
     is_read    TINYINT      NOT NULL DEFAULT 0,
     created_at DATETIME     DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
     KEY idx_emp (emp_id, is_read),
-    KEY idx_created (created_at)
+    KEY idx_created (created_at),
+    UNIQUE KEY uk_outbox (outbox_id, emp_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 通知发件箱（transactional outbox）：业务事务只往这里插一行，投递在事务提交后
+-- 由后台线程完成。拆成两步解决一个矛盾 —— 通知是这次业务的结果凭证，不能丢；
+-- 但投递过程（站内信落库、邮件、短信、企微）又绝不能拖长业务事务，尤其是外部
+-- 渠道的网络调用。
+-- 「只有提交成功才发通知」不需要任何记账代码：行写在业务事务里，回滚时跟着一起
+-- 消失，由 InnoDB 的提交可见性保证（和 events.py 把 point_records 当 outbox 同源）。
+CREATE TABLE IF NOT EXISTS notification_outbox (
+    id              INT          NOT NULL AUTO_INCREMENT,
+    event_key       VARCHAR(128) NOT NULL,  -- 业务事件幂等键，重放/重试不会重复入队
+    audience        VARCHAR(64)  NOT NULL,  -- 'user:<emp_id>' / 'role:super_admin,shop_admin'
+    ntype           VARCHAR(32)  NOT NULL DEFAULT 'system',
+    title           VARCHAR(255) NOT NULL,
+    content         VARCHAR(500) NOT NULL DEFAULT '',
+    ref_type        VARCHAR(32)  DEFAULT '',
+    ref_id          INT          DEFAULT NULL,
+    status          VARCHAR(16)  NOT NULL DEFAULT 'pending',  -- pending=待投递 sent=已投递 dead=重试耗尽
+    attempts        TINYINT      NOT NULL DEFAULT 0,
+    next_attempt_at DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,  -- 退避到期时间
+    last_error      VARCHAR(255) NOT NULL DEFAULT '',
+    created_at      DATETIME     DEFAULT CURRENT_TIMESTAMP,
+    updated_at      DATETIME     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    sent_at         DATETIME     DEFAULT NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_event (event_key),
+    KEY idx_due (status, next_attempt_at),
+    KEY idx_reap (status, sent_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS quiz_questions (

@@ -18,7 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .. import auth, db, events, logic, metrics, redemption, search_index
+from .. import auth, db, events, logic, metrics, notifier, redemption, search_index
 from ..auth import require_admin, require_roles
 
 router = APIRouter()
@@ -391,6 +391,18 @@ def list_audit_logs(
         "ORDER BY a.id DESC",
         (), page, size,
     )
+
+
+# ---------- 通知投递死信 ----------
+#
+# 通知走发件箱后，「投不出去」会留成 dead 状态而不是消失。这里给它一个观测入口：
+# 丢通知和丢埋点一样，静默消失比报错更糟 —— 你连补发都不知道该补哪条。
+@router.get("/api/admin/notifications/outbox")
+def list_notification_dead_letters(
+    limit: int = Query(50, ge=1, le=200),
+    _: dict = Depends(require_roles(*SUPER)),
+):
+    return {"counts": notifier.counts(), "dead": notifier.dead_letters(limit)}
 
 
 # ---------- 积分明细（全员流水 + 实时推送 + 人工操作）----------

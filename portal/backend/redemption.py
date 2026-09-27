@@ -12,7 +12,7 @@ import pymysql
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from . import db, logic
+from . import db, logic, notifier
 
 MAX_STOCK = 1_000_000_000
 MAX_POINTS = 1_000_000
@@ -122,11 +122,22 @@ def redeem(gid: int, payload: RequestIn, emp_id: str, session_id: str = ""):
         _stock_record(cur, gid, -1, gift["stock"] - 1, "redeem", oid, emp_id)
         logic.log_audit(emp_id, "redeem_order", "order", oid,
                         {"gift_id": gid, "points": cost, "request_id": payload.request_id}, cur=cur)
-        logic.notify(emp_id, "兑换成功", f"你已兑换「{gift['name']}」，消耗 {cost} 积分，等待发货",
-                     "redeem", oid, cur=cur)
+        # 通知只登记到发件箱，真正投递在事务提交之后：投递失败不该回滚这笔兑换，
+        # 外部渠道（邮件/短信）更不能拖着礼品行锁不放。事件键带上订单号，
+        # 重放与 1213 重试都只有一条入队。
+        notifier.enqueue(cur, event_key=f"redeem:{oid}", audience=notifier.user_audience(emp_id),
+                         ntype="redeem", ref_type="order", ref_id=oid,
+                         title="兑换成功",
+                         content=f"你已兑换「{gift['name']}」，消耗 {cost} 积分，等待发货")
         if gift["stock"] > logic.LOW_STOCK_THRESHOLD >= gift["stock"] - 1:
-            logic.notify_admins("库存告警", f"「{gift['name']}」库存仅剩 {gift['stock'] - 1} 件，请及时补货",
-                                "low_stock", gid, cur=cur)
+            # 受众写成角色，投递时才展开成具体管理员：事务里不必 SELECT users，
+            # 也不必为每个管理员各插一行。事件键用订单号锚定「这一次跨阈值」，
+            # 补货后再跌到同一水位仍能再告警一次。
+            notifier.enqueue(cur, event_key=f"low_stock:{gid}:{oid}",
+                             audience=notifier.role_audience(*notifier.SHOP_ADMIN_ROLES),
+                             ntype="low_stock", ref_type="gift", ref_id=gid,
+                             title="库存告警",
+                             content=f"「{gift['name']}」库存仅剩 {gift['stock'] - 1} 件，请及时补货")
         result = {"ok": True, "redemption_id": oid, "gift_name": gift["name"],
                   "points_cost": cost, "old_stock": gift["stock"]}
         cur.execute("UPDATE redemptions SET response_json = %s WHERE id = %s",
@@ -200,8 +211,11 @@ def ship(oid: int, express: str, actor: str):
         cur.execute("UPDATE redemptions SET status = 'shipped', express = %s, shipped_at = NOW() "
                     "WHERE id = %s AND status = 'pending'", (express, oid))
         logic.log_audit(actor, "ship_order", "order", oid, {"express": express}, cur=cur)
-        logic.notify(order["emp_id"], "订单已发货", f"「{gift['name']}」已发货，物流单号：{express}",
-                     "ship", oid, cur=cur)
+        notifier.enqueue(cur, event_key=f"ship:{oid}",
+                         audience=notifier.user_audience(order["emp_id"]),
+                         ntype="ship", ref_type="order", ref_id=oid,
+                         title="订单已发货",
+                         content=f"「{gift['name']}」已发货，物流单号：{express}")
         return {"ok": True}
     return _order_tx(oid, actor, fn)
 
@@ -237,8 +251,11 @@ def refund(oid: int, reason: str, actor: str, *, returned=False, owner_only=Fals
         _stock_record(cur, gift["id"], 1, gift["stock"] + 1, "refund", oid, actor, reason=reason)
         logic.log_audit(actor, "refund_order" if returned else "cancel_order", "order", oid,
                         {"reason": reason, "points": order["points_cost"], "returned": returned}, cur=cur)
-        logic.notify(order["emp_id"], "订单已退款", f"订单 #{oid} 已返还 {order['points_cost']} 积分",
-                     "refund", oid, cur=cur)
+        notifier.enqueue(cur, event_key=f"refund:{oid}",
+                         audience=notifier.user_audience(order["emp_id"]),
+                         ntype="refund", ref_type="order", ref_id=oid,
+                         title="订单已退款",
+                         content=f"订单 #{oid} 已返还 {order['points_cost']} 积分")
         return result
     return _order_tx(oid, actor, fn, owner_only)
 
