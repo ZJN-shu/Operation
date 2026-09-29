@@ -16,6 +16,15 @@
       <button id="login-btn" class="btn-primary">登 录</button>
       <p id="login-error" class="error"></p>
       <p class="login-hint">请使用管理员分配的账号登录；演示环境与正式数据隔离。</p>
+      <p class="login-hint"><a id="toggle-register" href="#" class="link">还没有账号？注册为普通用户</a></p>
+      <div id="register-box" class="register-box hidden">
+        <input id="reg-username" placeholder="用户名（3-32 位字母/数字/. - _）" autocomplete="username" />
+        <input id="reg-password" type="password" placeholder="密码（至少 6 位）" autocomplete="new-password" />
+        <input id="reg-name" placeholder="姓名（选填）" autocomplete="name" />
+        <input id="reg-department" placeholder="部门（选填）" />
+        <button id="register-btn" class="btn-outline">注 册</button>
+        <p id="register-error" class="error"></p>
+      </div>
     </div>
   </div>
 
@@ -44,6 +53,7 @@
       <button class="tab active" data-tab="home">🏠 首页</button>
       <button class="tab" data-tab="courses">📚 课程</button>
       <button class="tab" data-tab="gifts">🎁 礼品</button>
+      <button class="tab" data-tab="seckill">⚡ 秒杀</button>
       <button class="tab" data-tab="activities">🎪 活动公告</button>
       <button class="tab" data-tab="points">⭐ 我的积分</button>
     </nav>
@@ -52,6 +62,7 @@
       <section id="tab-home" class="tab-panel"></section>
       <section id="tab-courses" class="tab-panel hidden"></section>
       <section id="tab-gifts" class="tab-panel hidden"></section>
+      <section id="tab-seckill" class="tab-panel hidden"></section>
       <section id="tab-activities" class="tab-panel hidden"></section>
       <section id="tab-points" class="tab-panel hidden"></section>
     </main>
@@ -66,6 +77,7 @@
         <button class="admin-nav" data-section="gifts">🎁 积分兑换</button>
         <button class="admin-nav" data-section="orders">🚚 订单发货</button>
         <button class="admin-nav" data-section="audit">📜 审计日志</button>
+        <button class="admin-nav" data-section="members">👥 成员角色</button>
       </aside>
       <main class="admin-main">
         <section id="sec-dashboard" class="admin-section"></section>
@@ -74,6 +86,7 @@
         <section id="sec-gifts" class="admin-section hidden"></section>
         <section id="sec-orders" class="admin-section hidden"></section>
         <section id="sec-audit" class="admin-section hidden"></section>
+        <section id="sec-members" class="admin-section hidden"></section>
       </main>
     </div>
   </div>

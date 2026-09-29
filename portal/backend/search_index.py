@@ -151,8 +151,9 @@ def _fetch_by_ids(doc_type: str, ordered_ids: list[int]) -> list[dict]:
         sql = (f"SELECT id, title, category, level, points, emoji FROM courses "
                f"WHERE status = 'active' AND id IN ({placeholders})")
     else:
-        sql = (f"SELECT id, name, category, points_cost, stock, icon FROM gifts "
-               f"WHERE status = 'active' AND id IN ({placeholders})")
+        sql = (f"SELECT id, name, category, points_cost, icon, "
+               f"(SELECT COALESCE(SUM(b.stock),0) FROM gift_stock_bucket b WHERE b.gift_id = gifts.id) AS stock "
+               f"FROM gifts WHERE status = 'active' AND id IN ({placeholders})")
     by_id = {r["id"]: r for r in db.query(sql, tuple(ordered_ids))}
     return [by_id[i] for i in ordered_ids if i in by_id]
 
@@ -185,3 +186,21 @@ def search(q: str, limit: int = MAX_RESULTS) -> dict:
         "gifts": _fetch_by_ids("gift", ordered["gift"]),
         "keywords": tokens,   # 回传实际使用的分词结果，方便排查「为什么搜不到」
     }
+
+
+def record_zero_result(q: str) -> None:
+    """零结果查询落汇总（进阶：搜不到的词反哺内容）。
+
+    best-effort：记录失败只记日志，不能让统计链路把搜索主路径带倒。
+    upsert 撞 uk_term 唯一键 +1，不引入额外读；term 存原始查询（去首尾空白、
+    截到列宽），运营要看的是用户原话，不是 token。
+    """
+    term = (q or "").strip()[:64]
+    if not term:
+        return
+    try:
+        db.execute(
+            "INSERT INTO search_zero_terms (term) VALUES (%s) "
+            "ON DUPLICATE KEY UPDATE hits = hits + 1", (term,))
+    except Exception:
+        logger.warning("零结果词记录失败 q=%s", term, exc_info=True)

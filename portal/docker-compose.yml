@@ -1,0 +1,107 @@
+# 运营门户本地/内网演示编排（进阶部署：模仿 PaiSmart 的 compose 风格——
+# 命名卷 + healthcheck + 一次性 init 容器；差异点见每段注释）。
+# 用法（在本目录下）：docker compose up -d --build
+name: ops_portal_local
+
+services:
+  mysql:
+    image: mysql:8
+    container_name: ops-portal-mysql
+    restart: unless-stopped
+    # 宿主若已有原生 MySQL 占 3306，改左边端口即可（PaiSmart 同款处理）。
+    ports:
+      - "3308:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpw-change-me}
+      MYSQL_DATABASE: ops_portal
+    volumes:
+      - mysql-data:/var/lib/mysql
+      # 首次启动建库后，创建一个只给 DML 权限的运行账号（迁移账号另在 migrate 服务用 root）。
+      - ./docker/mysql-init.sql:/docker-entrypoint-initdb.d/10-app-user.sql:ro
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${MYSQL_ROOT_PASSWORD:-rootpw-change-me}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # 演进 B：共享会话存储。多 uvicorn worker 都能读到同一 token → 才能横向扩。
+  # 仅存会话（短期、可丢），无持久化需求：关 AOF/RDB，重启即清空会话（需重登）。
+  redis:
+    image: redis:7-alpine
+    container_name: ops-portal-redis
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  # 一次性迁移容器：用迁移账号跑 schema + 增量迁移，跑完即退出。
+  # 应用容器以 RUN_MIGRATIONS=0 启动，不再自带 DDL 副作用（见 portal/migrate.py）。
+  migrate:
+    build:
+      context: ..
+      dockerfile: portal/Dockerfile
+    container_name: ops-portal-migrate
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment: &app-env
+      MYSQL_HOST: mysql
+      MYSQL_PORT: "3306"
+      MYSQL_USER: root
+      MYSQL_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpw-change-me}
+      MYSQL_DB: ops_portal
+      SECRET_KEY: ${SECRET_KEY:-dev-secret-change-me}
+    command: ["python", "-m", "portal.migrate"]
+    restart: "no"
+
+  app:
+    build:
+      context: ..
+      dockerfile: portal/Dockerfile
+    container_name: ops-portal-app
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: *app-env
+      # 迁移与启动分离 + 账号分离：应用连只握 DML 的 portal_app，不碰 DDL。
+      MYSQL_USER: portal_app
+      MYSQL_PASSWORD: ${APP_DB_PASSWORD:-app-pw-change-me}
+      RUN_MIGRATIONS: "0"
+      # 会话外置到 Redis 后放开多 worker（演进 B）；每 worker 一池，池上限按 worker 数分摊。
+      SESSION_BACKEND: redis
+      REDIS_URL: redis://redis:6379/0
+      PORTAL_WORKERS: ${PORTAL_WORKERS:-4}
+      MYSQL_POOL_MAX: ${MYSQL_POOL_MAX:-8}
+      # 演进 C：非关键写（审计/通知/埋点）经 Redis Streams 异步落库，缩短 redeem 同步事务时延。
+      # 复用同一 redis；消费者随 worker 起、消费组自动横向扩。置 sync 即回到全同步（测试默认）。
+      MQ_BACKEND: ${MQ_BACKEND:-redis_streams}
+      MQ_STREAM: "{portal}:async_writes"
+      MQ_GROUP: writers
+      # 演示模式默认关。要一键灌演示数据、开免密登录，临时置 1（公网切勿开）。
+      PORTAL_DEMO_MODE: ${PORTAL_DEMO_MODE:-0}
+      # 图片直传阿里云 OSS：密钥从宿主机环境变量或 compose 同目录的 .env 透传，
+      # 绝不写死进本文件（compose 会入库）。未设置时为空串 → 后端 is_configured() 为假，
+      # 直传端点返回 409，前端自动退回 emoji 录入。
+      OSS_ENABLED: ${OSS_ENABLED:-0}
+      OSS_ENDPOINT: ${OSS_ENDPOINT:-}
+      OSS_BUCKET: ${OSS_BUCKET:-}
+      OSS_ACCESS_KEY_ID: ${OSS_ACCESS_KEY_ID:-}
+      OSS_ACCESS_KEY_SECRET: ${OSS_ACCESS_KEY_SECRET:-}
+      OSS_PUBLIC_BASE_URL: ${OSS_PUBLIC_BASE_URL:-}
+      OSS_MAX_UPLOAD_BYTES: ${OSS_MAX_UPLOAD_BYTES:-10485760}
+      OSS_UPLOAD_EXPIRE_SECONDS: ${OSS_UPLOAD_EXPIRE_SECONDS:-300}
+    ports:
+      - "8000:8000"
+
+volumes:
+  mysql-data:

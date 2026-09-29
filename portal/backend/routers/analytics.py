@@ -125,9 +125,11 @@ def dashboard(_: dict = Depends(require_admin)):
     # 而 /api/admin/gifts 挂在 GIFT_ADMINS 上（content_admin 和 viewer 都读不到），
     # 所以不能靠二次请求补库存 —— 走看板自己的载荷，四种管理角色都拿得到。
     top_gifts = db.query(
-        "SELECT g.id, g.name, g.icon, g.stock, g.points_cost, COUNT(r.id) AS c "
+        "SELECT g.id, g.name, g.icon, "
+        "(SELECT COALESCE(SUM(b.stock),0) FROM gift_stock_bucket b WHERE b.gift_id = g.id) AS stock, "
+        "g.points_cost, COUNT(r.id) AS c "
         "FROM redemptions r JOIN gifts g ON g.id = r.gift_id "
-        "GROUP BY g.id, g.name, g.icon, g.stock, g.points_cost ORDER BY c DESC LIMIT 5"
+        "GROUP BY g.id, g.name, g.icon, g.points_cost ORDER BY c DESC LIMIT 5"
     )
 
     recent_orders = db.query(

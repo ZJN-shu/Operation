@@ -16,9 +16,9 @@ from typing import List, Literal, Optional
 import pymysql
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .. import auth, db, events, logic, metrics, notifier, redemption, search_index
+from .. import auth, db, events, logic, metrics, notifier, oss, redemption, search_index
 from ..auth import require_admin, require_roles
 
 router = APIRouter()
@@ -92,7 +92,16 @@ class GiftIn(BaseModel):
     points_cost: int = Field(0, strict=True, ge=0, le=redemption.MAX_POINTS)
     stock: int = Field(0, strict=True, ge=0, le=redemption.MAX_STOCK)
     icon: str = Field("🎁", max_length=64)
+    image_key: str = Field("", max_length=255)
     description: str = Field("", max_length=10000)
+
+    @field_validator("image_key")
+    @classmethod
+    def _check_image_key(cls, v: str) -> str:
+        # 空串=不接图；非空必须是自家前缀下的合法 object key，挡住外链/越权对象名注入。
+        if v and not oss.validate_object_key(v):
+            raise ValueError("image_key 不是合法的 OSS 对象名")
+        return v
 
 
 class GiftUpdate(BaseModel):
@@ -101,8 +110,16 @@ class GiftUpdate(BaseModel):
     category: Optional[str] = Field(None, max_length=64)
     points_cost: Optional[int] = Field(None, strict=True, ge=0, le=redemption.MAX_POINTS)
     icon: Optional[str] = Field(None, max_length=64)
+    image_key: Optional[str] = Field(None, max_length=255)
     description: Optional[str] = Field(None, max_length=10000)
     status: Optional[Literal["active", "offline"]] = None
+
+    @field_validator("image_key")
+    @classmethod
+    def _check_image_key(cls, v: Optional[str]) -> Optional[str]:
+        if v and not oss.validate_object_key(v):
+            raise ValueError("image_key 不是合法的 OSS 对象名")
+        return v
 
     @model_validator(mode="after")
     def reject_null(self):
@@ -276,7 +293,8 @@ def list_gifts(
 ):
     return db.paginate(
         "SELECT COUNT(*) AS c FROM gifts",
-        "SELECT g.*, (SELECT COUNT(*) FROM redemptions r WHERE r.gift_id = g.id) AS redeemed "
+        "SELECT g.*, (SELECT COALESCE(SUM(b.stock),0) FROM gift_stock_bucket b WHERE b.gift_id = g.id) AS stock, "
+        "(SELECT COUNT(*) FROM redemptions r WHERE r.gift_id = g.id) AS redeemed "
         "FROM gifts g ORDER BY g.id ASC",
         (), page, size,
     )
@@ -286,11 +304,12 @@ def list_gifts(
 def create_gift(payload: GiftIn, user: dict = Depends(require_roles(*GIFT_ADMINS))):
     def fn(cur):
         cur.execute(
-            "INSERT INTO gifts (name, category, points_cost, stock, icon, description) "
-            "VALUES (%s, %s, %s, %s, %s, %s)",
+            "INSERT INTO gifts (name, category, points_cost, stock, icon, image_key, description) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
             (payload.name, payload.category, payload.points_cost, payload.stock, payload.icon,
-             payload.description))
+             payload.image_key, payload.description))
         gid = cur.lastrowid
+        db.seed_gift_buckets(cur, gid, payload.stock)
         redemption.stock_baseline(cur, {"id": gid, "stock": payload.stock}, user["emp_id"])
         logic.log_audit(user["emp_id"], "create_gift", "gift", gid, payload.model_dump(), cur=cur)
         return gid
@@ -833,3 +852,106 @@ def delete_question(qid: int, user: dict = Depends(require_roles(*COURSE_ADMINS)
     db.execute("DELETE FROM quiz_questions WHERE id = %s", (qid,))
     logic.log_audit(user["emp_id"], "delete_question", "question", qid)
     return {"ok": True}
+
+
+# ---------- 运维指标（进阶） ----------
+
+@router.get("/api/admin/ops/tx-stats")
+def tx_stats(_: dict = Depends(require_roles(*SUPER))):
+    """事务重试 / 连接池占用快照。进程级累计，重启归零——表述时不能说「历史总重试」。"""
+    return db.stats()
+
+
+@router.get("/api/admin/ops/audit-verify")
+def audit_verify(limit: int = Query(0, ge=0, le=10000),
+                 user: dict = Depends(require_roles(*SUPER))):
+    """验审计哈希链（limit=0 全量；周期校验建议限最近 N 行）。"""
+    result = logic.verify_audit_chain(limit)
+    logic.log_audit(user["emp_id"], "audit_verify", "audit_logs", None,
+                    {"ok": result["ok"], "rows": result["rows"]})
+    return result
+
+
+@router.get("/api/admin/search/zero-terms")
+def zero_terms(limit: int = Query(20, ge=1, le=100),
+               _: dict = Depends(require_roles(*COURSE_ADMINS, *GIFT_ADMINS))):
+    """搜不到的词 TOP：零结果查询汇总表，供内容侧反哺（补课程/补礼品描述）。"""
+    rows = db.query(
+        "SELECT term, hits, last_seen FROM search_zero_terms ORDER BY hits DESC, last_seen DESC LIMIT %s",
+        (limit,))
+    return {"terms": rows}
+
+
+# ---------- 图片直传 OSS（真实落地：对象存储） ----------
+
+class UploadIn(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    filename: str = Field(..., min_length=1, max_length=255)
+
+
+@router.get("/api/oss/config")
+def oss_config(_: dict = Depends(auth.get_current_user)):
+    """能力探测：前端据此决定要不要显示上传入口。只回约束，不回 AK/SK。"""
+    return oss.capability()
+
+
+@router.post("/api/admin/oss/upload-credential")
+def oss_upload_credential(payload: UploadIn, user: dict = Depends(require_roles(*GIFT_ADMINS))):
+    """下发一张受限直传凭证（key 固定 + 5分钟过期 + 10MB 上限）。
+
+    未配置 OSS 时明确返回 409（功能未启用），不是 500：前端拿到 409 应退回 emoji 录入。
+    """
+    try:
+        cred = oss.make_upload_credential(user["emp_id"], payload.filename)
+    except (ValueError, RuntimeError) as exc:
+        # ValueError=类型白名单不过；RuntimeError=OSS 未启用/未配齐
+        detail = str(exc)
+        status = 400 if isinstance(exc, ValueError) else 409
+        raise HTTPException(status, detail)
+    return {"ok": True, **cred}
+
+
+# ---------- 成员与角色管理（仅超管：把普通用户设为不同管理类别） ----------
+
+# 可分配角色白名单：与 auth.ADMIN_ROLES + 'user' 对齐，避免非法角色注入。
+ASSIGNABLE_ROLES = ("user", "viewer", "content_admin", "shop_admin", "super_admin")
+
+
+class RoleIn(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    role: Literal["user", "viewer", "content_admin", "shop_admin", "super_admin"]
+
+
+@router.get("/api/admin/users")
+def list_users(_: dict = Depends(require_roles(*SUPER))):
+    """成员清单（不回 password_hash）。仅 super_admin 可见。"""
+    rows = db.query(
+        "SELECT emp_id, username, name, role, department, created_at "
+        "FROM users ORDER BY created_at DESC, emp_id ASC"
+    )
+    return {"ok": True, "users": rows}
+
+
+@router.patch("/api/admin/users/{emp_id}/role")
+def update_user_role(emp_id: str, payload: RoleIn, user: dict = Depends(require_roles(*SUPER))):
+    """调整成员角色；改完吊销其全部会话，强制重新登录以生效新权限界面。
+
+    防自锁：不允许超管把自己从 super_admin 降下去——否则当场失去后台权限且无人可再授权。
+    """
+    target = db.query_one("SELECT emp_id, role FROM users WHERE emp_id = %s", (emp_id,))
+    if not target:
+        raise HTTPException(404, "用户不存在")
+    new_role = payload.role
+    if new_role not in ASSIGNABLE_ROLES:
+        raise HTTPException(400, "非法角色")
+    if target["role"] == new_role:
+        return {"ok": True, "role": new_role, "unchanged": True}
+    if emp_id == user["emp_id"] and new_role != "super_admin":
+        raise HTTPException(400, "不能降低自己的角色")
+
+    db.execute("UPDATE users SET role = %s WHERE emp_id = %s", (new_role, emp_id))
+    dropped = auth.drop_user_sessions(emp_id)
+    logic.log_audit(user["emp_id"], "update_user_role", "user", None,
+                    {"target_emp_id": emp_id, "from": target["role"],
+                     "to": new_role, "revoked_sessions": dropped})
+    return {"ok": True, "role": new_role, "revoked_sessions": dropped}

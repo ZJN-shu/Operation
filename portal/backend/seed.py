@@ -153,6 +153,7 @@ def seed() -> bool:
     def baselines(cur):
         cur.execute("SELECT id, stock FROM gifts ORDER BY id FOR UPDATE")
         for gift in cur.fetchall():
+            db.seed_gift_buckets(cur, gift["id"], gift["stock"])
             redemption.stock_baseline(cur, gift, "1001")
     db.run_tx(baselines)
 

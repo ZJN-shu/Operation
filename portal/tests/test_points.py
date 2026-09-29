@@ -840,6 +840,10 @@ class TestBulkPointClassification(unittest.TestCase):
                 cls.reverted.add(rid)
         cur.executemany("INSERT INTO point_accounts (emp_id,balance) VALUES (%s,%s)", list(cls.balances.items()))
         cur.executemany("UPDATE gifts SET stock=%s WHERE id=%s", [(value, gid) for gid, value in cls.stocks.items()])
+        # 库存分桶后桶总和才是真相：这个归类夹具直造流水，必须把桶也对齐到 cls.stocks，
+        # 否则对账会报「账实不符」。夹具从空建桶，seed_gift_buckets 的 INSERT IGNORE 幂等。
+        for gid, value in cls.stocks.items():
+            db.seed_gift_buckets(cur, gid, value)
 
     @classmethod
     def cleanup(cls):
@@ -854,6 +858,7 @@ class TestBulkPointClassification(unittest.TestCase):
                 if ids:
                     if table == "gifts":
                         cur.execute("DELETE FROM gift_stock_records WHERE gift_id IN %s", (ids,))
+                        cur.execute("DELETE FROM gift_stock_bucket WHERE gift_id IN %s", (ids,))
                     cur.execute(f"DELETE FROM {table} WHERE id IN %s", (ids,))
             cur.execute("DELETE FROM users WHERE emp_id IN %s", (cls.identities,))
         db.run_tx(clean)

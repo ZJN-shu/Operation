@@ -118,11 +118,24 @@ CREATE TABLE IF NOT EXISTS gifts (
     points_cost INT          NOT NULL DEFAULT 0,
     stock       INT          NOT NULL DEFAULT 0,
     icon        VARCHAR(64)  DEFAULT '🎁',       -- emoji 或图片路径
+    image_key   VARCHAR(255) DEFAULT '',          -- OSS 对象 key（非 URL）；读取时按公开基址拼 URL
     description TEXT,
     status      VARCHAR(16)  NOT NULL DEFAULT 'active',  -- active=上架 offline=下架
     created_at  DATETIME     DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
     KEY idx_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 库存分桶（写路径去串行化）：把热点礼品的单行 gifts.stock 拆成 K 个桶行，
+-- 并发兑换按 emp 哈希落各自桶、各锁各的桶行，把「同礼品抢最后一件」的串行队
+-- 拆成并行。桶存量之和才是库存真相：gifts.stock 退为展示/缓存值，读侧一律 SUM(bucket)。
+-- 无超卖：每桶 UPDATE ... WHERE stock>0 的 rowcount 保证只从非空桶扣；无假售罄：
+-- home 桶空时轮转下一桶；无死锁：一个兑换事务只锁一个桶行，冷路径按 bucket_no 升序锁。
+CREATE TABLE IF NOT EXISTS gift_stock_bucket (
+    gift_id   INT NOT NULL,
+    bucket_no INT NOT NULL,
+    stock     INT NOT NULL DEFAULT 0,
+    PRIMARY KEY (gift_id, bucket_no)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS redemptions (
@@ -249,6 +262,18 @@ CREATE TABLE IF NOT EXISTS search_keywords (
     KEY idx_kw (keyword, doc_type)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- 搜不到的词（进阶）：零结果查询落一张汇总表，运营看板按次数排序反哺内容。
+-- 存 tokenize 后的原始查询（非 token）：运营要看的是「用户搜了什么」。
+CREATE TABLE IF NOT EXISTS search_zero_terms (
+    id         INT         NOT NULL AUTO_INCREMENT,
+    term       VARCHAR(64) NOT NULL,
+    hits       INT         NOT NULL DEFAULT 1,
+    last_seen  DATETIME    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_term (term),
+    KEY idx_hits (hits)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 CREATE TABLE IF NOT EXISTS app_settings (
     name  VARCHAR(64) NOT NULL,
     value TEXT,
@@ -262,11 +287,29 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     target_type VARCHAR(32) DEFAULT '',
     target_id   INT         DEFAULT NULL,
     detail      TEXT,
+    -- 哈希链（进阶）：row_hash = SHA256(前一行哈希 | 本行业务字段)，prev_hash 指向链尾。
+    -- 空串 = 接入前的历史行（v1 基线），不参与校验；篡改任意 v2 行会让 verify 断链。
+    prev_hash   VARCHAR(64) NOT NULL DEFAULT '',
+    row_hash    VARCHAR(64) NOT NULL DEFAULT '',
+    -- 审计锚点分片：本行属于第几条链（= stable_slot(emp_id)）。单行锚点表已拆成
+    -- 多条独立链，每行必须记住自己在哪条链上，verify/backfill 才能按链重接。
+    chain_id    TINYINT     NOT NULL DEFAULT 0,
     created_at  DATETIME    DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
     KEY idx_emp (emp_id),
     KEY idx_action (action),
-    KEY idx_created (created_at)
+    KEY idx_created (created_at),
+    KEY idx_chain (chain_id, id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 链尾指针：单行表，写审计时 FOR UPDATE 锁这一行把并发追加串行化。
+-- 为什么不用「读最后一行 FOR UPDATE」：表空时无行可锁，间隙锁会把整表锁成
+-- 串行域还容易和业务写入对撞死锁；锚点行是确定的主键行锁，代价可预测。
+CREATE TABLE IF NOT EXISTS audit_chain (
+    id       TINYINT     NOT NULL,
+    last_hash VARCHAR(64) NOT NULL DEFAULT '',
+    seq      INT         NOT NULL DEFAULT 0,
+    PRIMARY KEY (id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS notifications (
@@ -340,4 +383,34 @@ CREATE TABLE IF NOT EXISTS quiz_attempts (
     PRIMARY KEY (id),
     KEY idx_emp (emp_id),
     KEY idx_course (course_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 秒杀场次（演进 D 定时化）：管理员上架某礼品时排一个「几点开抢」的场次。
+-- 真相仍在 DB：status 由调度线程按时间推进 scheduled→live→ended；live 时把额度预热进 Redis。
+-- stock 是本场秒杀额度（Redis 预扣上界），与礼品真实库存对齐由预热时的 COALESCE 口径保证。
+CREATE TABLE IF NOT EXISTS seckill_sessions (
+    id          INT          NOT NULL AUTO_INCREMENT,
+    gift_id     INT          NOT NULL,
+    start_at    DATETIME     NOT NULL,             -- 开抢时刻
+    end_at      DATETIME     DEFAULT NULL,          -- 收摊时刻（转 live 时按窗口算出）
+    stock       INT          NOT NULL DEFAULT 0,    -- 本场额度
+    status      VARCHAR(16)  NOT NULL DEFAULT 'scheduled',  -- scheduled/live/ended/cancelled
+    notified_at DATETIME     DEFAULT NULL,          -- 提前 N 分钟提醒已发的时间戳（判重，只发一次）
+    created_by  VARCHAR(32)  NOT NULL,
+    created_at  DATETIME     DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    KEY idx_gift_status (gift_id, status),
+    KEY idx_status_start (status, start_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 秒杀预约名单：预约=订阅开抢提醒（不锁名额，名额仍到点先到先得）。
+-- uk(session_id, emp_id) 让重复预约幂等，也是提醒受众的唯一来源。
+CREATE TABLE IF NOT EXISTS seckill_reservations (
+    id         INT         NOT NULL AUTO_INCREMENT,
+    session_id INT         NOT NULL,
+    emp_id     VARCHAR(32) NOT NULL,
+    created_at DATETIME    DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_sess_emp (session_id, emp_id),
+    KEY idx_emp (emp_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

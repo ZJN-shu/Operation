@@ -1,0 +1,45 @@
+# 构建上下文是仓库根（compose 里 context: ..），这里排除不需要进镜像的东西，
+# 既减小发给 daemon 的上下文体积，也避免密钥/资料被无意打包。
+# 与 .gitignore 互补：.gitignore 管版本库，.dockerignore 管构建上下文。
+
+# 环境与密钥：绝不进镜像上下文
+.env
+*.env
+!.env.example
+
+# Python 缓存与虚拟环境
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 日志与测试临时实例
+*.log
+server.log
+.mysql-test-*/
+.mysql-test-*
+
+# 对外资料（文档、图片、提取产物）——不进镜像
+*.docx
+*.pdf
+*.html
+图片/
+*.jpg
+*.jpeg
+*.png
+_extract/
+_out.txt
+链路逻辑.txt
+*.md
+!portal/README.md
+
+# 编辑器 / 系统 / 本地工具
+.git/
+.github/
+.claude/
+.vscode/
+.idea/
+.workbuddy/
+.DS_Store
+Thumbs.db

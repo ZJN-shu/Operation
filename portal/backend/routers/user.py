@@ -48,7 +48,9 @@ def courses(user: dict = Depends(get_current_user)):
 @router.get("/api/user/gifts")
 def gifts(user: dict = Depends(get_current_user)):
     rows = db.query(
-        "SELECT g.id, g.name, g.category, g.points_cost, g.stock, g.icon, "
+        "SELECT g.id, g.name, g.category, g.points_cost, "
+        "(SELECT COALESCE(SUM(b.stock),0) FROM gift_stock_bucket b WHERE b.gift_id = g.id) AS stock, "
+        "g.icon, g.image_key, "
         "(SELECT COUNT(*) FROM redemptions r WHERE r.gift_id = g.id) AS redeemed "
         "FROM gifts g WHERE g.status = 'active' ORDER BY g.id ASC"
     )
@@ -122,7 +124,8 @@ def course_detail(cid: int, user: dict = Depends(get_current_user)):
 @router.get("/api/user/gifts/{gid}")
 def gift_detail(gid: int, user: dict = Depends(get_current_user)):
     row = db.query_one(
-        "SELECT * FROM gifts WHERE id = %s AND status = 'active'", (gid,)
+        "SELECT g.*, (SELECT COALESCE(SUM(b.stock),0) FROM gift_stock_bucket b WHERE b.gift_id = g.id) AS stock "
+        "FROM gifts g WHERE g.id = %s AND g.status = 'active'", (gid,)
     )
     if not row:
         raise HTTPException(404, "礼品不存在或已下架")
@@ -311,6 +314,10 @@ def search(q: str = Query(..., min_length=1, max_length=50), user: dict = Depend
     """走倒排索引：多词交集召回 + 字段加权排序（见 search_index 模块头注释）。"""
     result = search_index.search(q)
     logic.log_event_for(user, "search", properties={"keyword": q})
+    # 零结果词单独落汇总（进阶）：热词看板只看得到「搜到了什么」，
+    # 内容反哺要的是「什么搜不到」。best-effort，失败不阻断搜索。
+    if not result["courses"] and not result["gifts"]:
+        search_index.record_zero_result(q)
     return {"query": q, **result}
 
 

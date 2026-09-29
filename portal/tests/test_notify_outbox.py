@@ -56,6 +56,7 @@ class TestNotificationOutbox(unittest.TestCase):
             ("DELETE FROM point_records WHERE emp_id LIKE %s", MARK + "%"),
             ("DELETE FROM point_accounts WHERE emp_id LIKE %s", MARK + "%"),
             ("DELETE FROM gift_stock_records WHERE gift_id=%s", cls.gift),
+            ("DELETE FROM gift_stock_bucket WHERE gift_id=%s", cls.gift),
             ("DELETE FROM audit_logs WHERE emp_id LIKE %s", MARK + "%"),
             ("DELETE FROM gifts WHERE id=%s", cls.gift),
             ("DELETE FROM users WHERE emp_id LIKE %s", MARK + "%"),
@@ -71,10 +72,20 @@ class TestNotificationOutbox(unittest.TestCase):
     def setUp(self):
         self.purge()
         db.execute("DELETE FROM notifications WHERE emp_id LIKE %s", (MARK + "%",))
-        # 每个用例都从同一份业务状态开始：礼品库存与余额会被前面的用例消耗掉，
+        # 每个用例都从同一份业务状态开始：库存与余额会被前面的用例消耗掉，
         # 不留神就会让后面的兑换变成「库存不足」而什么都没发生。
+        # 库存真相已是「桶总和」，只改 gifts.stock 不会被动到扣减路径，故用 sync_bucket
+        # 把桶重置到目标值（等价于「新礼品首次触碰按 gifts.stock 快照建桶」）。
         db.execute("UPDATE gifts SET stock = 100 WHERE id = %s", (self.gift,))
+        self.sync_bucket(100)
         db.execute("UPDATE point_accounts SET balance = 1000 WHERE emp_id = %s", (self.emp,))
+
+    def sync_bucket(self, value):
+        """把该礼品的库存桶强制重置为总和 value（先删后建，幂等于快照）。"""
+        def fn(cur):
+            cur.execute("DELETE FROM gift_stock_bucket WHERE gift_id = %s", (self.gift,))
+            db.seed_gift_buckets(cur, self.gift, value)
+        db.run_tx(fn)
 
     # ---------- 工具 ----------
 
@@ -117,7 +128,7 @@ class TestNotificationOutbox(unittest.TestCase):
 
     def test_库存跨阈值只产生一条告警(self):
         """告警事件键用订单号锚定「这一次跨阈值」：继续卖到 2、1 件不再重复轰炸管理员。"""
-        db.execute("UPDATE gifts SET stock = 4 WHERE id = %s", (self.gift,))
+        self.sync_bucket(4)   # 库存真相=SUM(桶)：直接重置桶到 4，而不是只改缓存
         alerts = lambda: [r for r in self.outbox_rows() if r["ntype"] == "low_stock"]
         self.redeem()      # 4 → 3，跨过阈值
         self.assertEqual(len(alerts()), 1)

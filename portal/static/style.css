@@ -52,6 +52,9 @@ body {
 }
 .login-card input:focus { outline: none; border-color: var(--primary); }
 .login-hint { margin-top: 18px; color: var(--muted); font-size: 12px; line-height: 1.7; }
+.login-hint .link { color: var(--primary); cursor: pointer; text-decoration: none; }
+.register-box { display: flex; flex-direction: column; gap: 10px; margin-top: 4px; }
+.role-select { padding: 6px 10px; border-radius: 8px; border: 1px solid #d6dbe6; background: #fff; font-size: 13px; }
 
 /* ---------- 顶栏 ---------- */
 .topbar {
@@ -207,6 +210,9 @@ button { cursor: pointer; font-family: inherit; }
 /* 课程/礼品/活动卡片 */
 .item-card { background: var(--card); border-radius: var(--radius); box-shadow: var(--shadow); padding: 18px; display: flex; flex-direction: column; gap: 10px; }
 .item-emoji { font-size: 38px; }
+.item-img { width: 64px; height: 64px; object-fit: cover; border-radius: 10px; display: block; margin: 0 auto; }
+.gift-img { text-align: center; margin: 8px 0; }
+.gift-img .item-img { width: 160px; height: 160px; }
 .item-title { font-size: 16px; font-weight: 600; }
 .item-meta { color: var(--muted); font-size: 13px; line-height: 1.6; }
 .item-footer { margin-top: auto; display: flex; align-items: center; justify-content: space-between; gap: 8px; }

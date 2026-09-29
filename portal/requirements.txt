@@ -2,3 +2,6 @@ fastapi>=0.110
 uvicorn>=0.27
 pymysql>=1.1
 DBUtils>=3.0
+# 演进 B：会话外置到 Redis 以解锁多 worker。仅 SESSION_BACKEND=redis 时才惰性导入
+# （见 redis_client.py），process 后端与测试路径不碰它，但对部署而言是运行时依赖。
+redis>=5.0

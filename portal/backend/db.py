@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import random
@@ -25,6 +26,19 @@ _SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
 
 _pool: PooledDB | None = None
 _pool_lock = threading.RLock()
+
+# 事务与连接池可观测（进阶）：把「重试吸收了多少次锁冲突、池子借出去多少条」
+# 从日志里的散文变成可拉取的计数器。只记累计值与峰值，不存样本，开销 O(1)。
+_tx_stats = {
+    "tx_total": 0,            # run_tx 调用总次数（含重试前的口径）
+    "retry_attempts": 0,      # 实际发生过的重试次数合计
+    "retry_absorbed": 0,      # 重试后最终成功的次数（一次事务可能重试多轮计 1）
+    "retry_exhausted": 0,     # 重试用尽仍抛锁冲突的次数（这类才是重试机制木够不着的）
+    "by_code": {},            # 按错误码分布：1213 / 1205
+    "pool_in_use_peak": 0,    # 借出连接数历史峰值
+    "pool_wait_peak": 0,      # （近似）借出数触顶 maxconnections 的命中次数
+}
+_stats_lock = threading.Lock()
 
 # InnoDB 并发下可自愈的瞬态锁冲突：1213 死锁（引擎已回滚整个事务）、
 # 1205 锁等待超时。只有这两个码会被 run_tx 的有界重试吞掉；断连（20xx）、
@@ -152,6 +166,17 @@ _MIGRATIONS: tuple[str, ...] = (
     # notification_outbox 本身由 schema.sql 的 CREATE IF NOT EXISTS 建，老库启动即补齐。
     "ALTER TABLE notifications ADD COLUMN outbox_id INT DEFAULT NULL AFTER ref_id",
     "ALTER TABLE notifications ADD UNIQUE KEY uk_outbox (outbox_id, emp_id)",
+    # 审计哈希链（进阶）：补列后由 _backfill_audit_chain 逐行回填历史行哈希，
+    # 链从第一行审计就算得起；新行在 logic.log_audit 里接着链尾追加。
+    # 锚点表也在迁移里兼容一份：老库在 schema.sql 不重跑新建语句的极端情况下也能补齐。
+    "CREATE TABLE IF NOT EXISTS audit_chain (id TINYINT NOT NULL, last_hash VARCHAR(64) NOT NULL DEFAULT '', seq INT NOT NULL DEFAULT 0, PRIMARY KEY (id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+    # 预置单行锚点：log_audit 靠 SELECT ... FOR UPDATE 锁这一行串行化追加。若不预插，
+    # 表空时第一个并发事务读不到锁行会各自 prev='' 开链 → 链分叉。INSERT IGNORE 幂等。
+    "INSERT IGNORE INTO audit_chain (id, last_hash, seq) VALUES (1, '', 0)",
+    "ALTER TABLE audit_logs ADD COLUMN prev_hash VARCHAR(64) NOT NULL DEFAULT '' AFTER detail",
+    "ALTER TABLE audit_logs ADD COLUMN row_hash VARCHAR(64) NOT NULL DEFAULT '' AFTER prev_hash",
+    # 图片直传 OSS（真实落地）：存受控 object key，非签名 URL；老库补列默认空串代表未接图。
+    "ALTER TABLE gifts ADD COLUMN image_key VARCHAR(255) DEFAULT '' AFTER icon",
 )
 
 # 1060 = Duplicate column name，1061 = Duplicate key name
@@ -167,6 +192,129 @@ def _migrate(cur) -> None:
             if exc.args[0] in _IGNORED_DDL_ERRORS:
                 continue
             raise
+    # 审计锚点分片：chain_id 列若本次才补上，说明是从单链老库迁移过来，
+    # 需要一次性把历史行按分链重算哈希（老单链跨行 prev 与新分链不兼容）。
+    reshard = _ensure_audit_shards(cur)
+    _backfill_audit_chain(cur, full=reshard)
+    _seed_stock_buckets(cur)
+
+
+def split_stock(total: int, k: int) -> list[tuple[int, int]]:
+    """把一个总库存平摊到 k 个桶：尽量均匀，余数进 0 号桶。
+
+    不一次性堆在 0 号桶：否则用户哈希到 1..K-1 的桶都空，兑换总要轮转到 0 号桶，
+    串行回到单行，分桶白做。平摊后并发兑换能真正并行到不同桶行。
+    """
+    if k <= 1:
+        return [(0, total)]
+    base, rem = divmod(total, k)
+    return [(b, base + (rem if b == 0 else 0)) for b in range(k)]
+
+
+def seed_gift_buckets(cur, gid: int, total: int, k: int | None = None) -> None:
+    """为礼品初始化 K 个库存桶（幂等：INSERT IGNORE）。已存在的桶不重分、不叠加。
+
+    并发首次触碰时两个事务都看到空桶、都用同一 total 跑本函数：第二个的
+    INSERT IGNORE 全被忽略，不会重复插量 —— 库存不会被分桶本身翻倍。
+    """
+    k = k or config.STOCK_BUCKETS
+    for b, amt in split_stock(total, k):
+        cur.execute(
+            "INSERT IGNORE INTO gift_stock_bucket (gift_id, bucket_no, stock) VALUES (%s,%s,%s)",
+            (gid, b, amt))
+
+
+def _seed_stock_buckets(cur) -> None:
+    """启动时给还没建桶的存量礼品按 gifts.stock 快照分桶（老库升级的一次性补齐）。"""
+    cur.execute(
+        "SELECT g.id, g.stock FROM gifts g "
+        "WHERE NOT EXISTS (SELECT 1 FROM gift_stock_bucket b WHERE b.gift_id = g.id)")
+    for r in cur.fetchall() or []:
+        seed_gift_buckets(cur, r["id"], r["stock"])
+
+
+def stable_slot(key: str, n: int) -> int:
+    """把字符串稳定映射到 0..n-1 的分片号（跨进程一致）。
+
+    绝不能用内建 hash()：CPython 对 str 的 hash 带 PYTHONHASHSEED 随机盐，
+    多进程 / 重启后同一 emp_id 会漂到不同分片，审计链直接分叉、库存桶归属也会乱。
+    用 sha256 取前 8 hex 转整数再取模，确定性且不依赖运行时盐。
+    """
+    if n <= 1:
+        return 0
+    digest = hashlib.sha256(str(key).encode("utf-8")).hexdigest()
+    return int(digest[:8], 16) % n
+
+
+def _audit_digest(prev_hash: str, row: tuple) -> str:
+    """链式哈希的规范序列化：参入字段顺序固定，分隔符用 \x00 避免字段内容仿冒接缝。
+
+    建链（回填）与验链（verify）必须共用本函数，否则口径漂移会把正常链判成篡改。
+    """
+    payload = "\x00".join([prev_hash, *row]).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _ensure_audit_shards(cur) -> bool:
+    """补 chain_id 列 + 播 N 条分链锚点行。返回本次是否刚刚新增列（需全量重算历史）。"""
+    just_added = False
+    try:
+        cur.execute("ALTER TABLE audit_logs ADD COLUMN chain_id TINYINT NOT NULL DEFAULT 0 AFTER row_hash")
+        just_added = True
+    except pymysql.err.OperationalError as exc:
+        if exc.args[0] != 1060:
+            raise
+    try:
+        cur.execute("ALTER TABLE audit_logs ADD KEY idx_chain (chain_id, id)")
+    except pymysql.err.OperationalError as exc:
+        if exc.args[0] != 1061:
+            raise
+    for i in range(config.AUDIT_CHAIN_SHARDS):
+        cur.execute("INSERT IGNORE INTO audit_chain (id, last_hash, seq) VALUES (%s, '', 0)", (i,))
+    return just_added
+
+
+def _backfill_audit_chain(cur, full: bool = False) -> None:
+    """按分链给还没有哈希的审计行补算 row_hash（幂等，启动时跑）。
+
+    每条分链各自从 audit_chain[id] 的链尾往后接：同一分链内严格串接、跨分链互不相关。
+    full=True 时是老→新分片的一次性迁移：先把所有行 prev/row_hash 清空、按 emp_id 重分链、
+    重置所有锚点，再逐链重建（老单链的跨行 prev 与新分链不兼容，必须整体重算）。
+    full=False（常规启动）只接 row_hash='' 的新行，绝不重算已有哈希 ——
+    否则重启会把入库后发生的篡改“抹平”成自洽，丢防篡改能力。
+    """
+    n = config.AUDIT_CHAIN_SHARDS
+    if full:
+        cur.execute("SELECT id, emp_id FROM audit_logs")
+        for r in cur.fetchall() or []:
+            cur.execute("UPDATE audit_logs SET prev_hash='', row_hash='', chain_id=%s WHERE id=%s",
+                        (stable_slot(r["emp_id"], n), r["id"]))
+        cur.execute("UPDATE audit_chain SET last_hash='', seq=0")
+    for shard in range(n):
+        cur.execute(
+            "SELECT id, emp_id, action, target_type, IFNULL(target_id, -1) AS tid, "
+            "IFNULL(detail, '') AS d, created_at FROM audit_logs "
+            "WHERE chain_id = %s AND row_hash = '' ORDER BY id", (shard,))
+        rows = cur.fetchall() or []
+        if not rows:
+            continue
+        cur.execute("SELECT last_hash, seq FROM audit_chain WHERE id = %s FOR UPDATE", (shard,))
+        tail = cur.fetchone()
+        prev = tail["last_hash"] if tail else ""
+        seq = (tail["seq"] if tail else 0)
+        last = None
+        for r in rows:
+            fields = (str(r["emp_id"]), str(r["action"]), str(r["target_type"]),
+                      str(r["tid"]), str(r["d"]), str(r["created_at"]))
+            last = _audit_digest(prev, fields)
+            cur.execute("UPDATE audit_logs SET prev_hash = %s, row_hash = %s WHERE id = %s",
+                        (prev, last, r["id"]))
+            prev = last
+            seq += 1
+        cur.execute(
+            "INSERT INTO audit_chain (id, last_hash, seq) VALUES (%s, %s, %s) "
+            "ON DUPLICATE KEY UPDATE last_hash = VALUES(last_hash), seq = VALUES(seq)",
+            (shard, last, seq))
 
 
 def _split_statements(sql: str) -> list[str]:
@@ -237,21 +385,75 @@ def run_tx(fn: Callable[[pymysql.cursors.Cursor], Any], *, read_snapshot: bool =
     事务体开头的幂等重放读”兜住这一点，而不是靠内存标记。
 
     业务用的 HTTPException、语法/约束错误、断连（20xx）等一律不重试，原样抛出。
+
+    重试过程同步计入模块级计数器（见 stats()）：面试/运维问「重试到底有没有发生、
+    池子到底多紧张」时拿数字而不是拿印象。
     """
     attempt = 0
+    with _stats_lock:
+        _tx_stats["tx_total"] += 1
     while True:
         try:
-            return _run_once(fn, read_snapshot=read_snapshot)
+            result = _run_once(fn, read_snapshot=read_snapshot)
+            if attempt:
+                with _stats_lock:
+                    _tx_stats["retry_absorbed"] += 1
+            return result
         except pymysql.err.OperationalError as exc:
             code = exc.args[0] if exc.args else None
+            if code in _RETRYABLE_MYSQL_ERRORS:
+                with _stats_lock:
+                    _tx_stats["by_code"][str(code)] = _tx_stats["by_code"].get(str(code), 0) + 1
             if attempt >= retries or code not in _RETRYABLE_MYSQL_ERRORS:
+                if code in _RETRYABLE_MYSQL_ERRORS and attempt >= retries:
+                    with _stats_lock:
+                        _tx_stats["retry_exhausted"] += 1
                 raise
             attempt += 1
+            with _stats_lock:
+                _tx_stats["retry_attempts"] += 1
             logger.warning("事务撞 InnoDB 瞬态锁冲突(code=%s)，第 %d/%d 次重试",
                            code, attempt, retries)
             delay = min(retry_base_delay * (2 ** (attempt - 1)), retry_max_delay)
             # 加随机抖动，避免多个受害者同一时刻齐步重试再次对撞。
             time.sleep(delay + random.uniform(0, delay))
+
+
+def stats() -> dict:
+    """事务/连接池指标快照：累计计数器 + 池子即时占用（PooledDB  introspection）。
+
+    PooledDB 的 thread_usage()/idle_connections() 在 DBUtils 3.x 提供；版本不符时
+    降级为只返回计数器，pool 字段标 unavailable，不让观测代码把主链路带倒。
+    """
+    with _stats_lock:
+        snap = dict(_tx_stats)
+        snap["by_code"] = dict(_tx_stats["by_code"])
+    pool = _pool
+    if pool is None:
+        snap["pool"] = {"status": "not_initialized"}
+        return snap
+    # DBUtils 不同版本把参数暴露成 maxconnections 或 _maxconnections，
+    # 属性缺失/改名在维护期很常见：宁可降级成 unavailable，不让观测代码把主链路带倒。
+    max_conn = getattr(pool, "maxconnections", None) or getattr(pool, "_maxconnections", None)
+    idle_fn = getattr(pool, "idle_connections", None)
+    if not max_conn or not callable(idle_fn):
+        snap["pool"] = {"status": "unavailable"}
+        return snap
+    try:
+        idle = idle_fn()
+    except Exception:
+        snap["pool"] = {"status": "unavailable"}
+        return snap
+    in_use = max_conn - idle
+    snap["pool"] = {"maxconnections": max_conn, "idle": idle, "in_use": in_use}
+    with _stats_lock:
+        if in_use > _tx_stats["pool_in_use_peak"]:
+            _tx_stats["pool_in_use_peak"] = in_use
+        snap["pool_in_use_peak"] = _tx_stats["pool_in_use_peak"]
+        if in_use >= max_conn:
+            _tx_stats["pool_wait_peak"] += 1
+        snap["pool_wait_peak"] = _tx_stats["pool_wait_peak"]
+    return snap
 
 
 def _run_once(fn: Callable[[pymysql.cursors.Cursor], Any], *, read_snapshot: bool) -> Any:

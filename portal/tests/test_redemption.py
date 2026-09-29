@@ -189,6 +189,7 @@ class TestRedemption(unittest.TestCase):
                 db.execute(f"DELETE FROM {table} WHERE {field}=%s", (emp,))
         for gid in self.gifts:
             db.execute("DELETE FROM gift_stock_records WHERE gift_id=%s", (gid,))
+            db.execute("DELETE FROM gift_stock_bucket WHERE gift_id=%s", (gid,))
             db.execute("DELETE FROM search_keywords WHERE doc_type='gift' AND doc_id=%s", (gid,))
             db.execute("DELETE FROM notifications WHERE ntype='low_stock' AND ref_id=%s", (gid,))
             db.execute("DELETE FROM notification_outbox WHERE ref_type='gift' AND ref_id=%s", (gid,))
@@ -205,15 +206,20 @@ class TestRedemption(unittest.TestCase):
     def make_gift(self, stock=4, cost=60, baseline=True):
         gid = db.insert("INSERT INTO gifts (name,points_cost,stock) VALUES ('验收礼品',%s,%s)", (cost, stock))
         self.gifts.append(gid)
-        if baseline:
-            db.run_tx(lambda cur: domain.stock_baseline(cur, {"id": gid, "stock": stock}, self.operator))
+
+        def prep(cur):
+            db.seed_gift_buckets(cur, gid, stock)
+            if baseline:
+                domain.stock_baseline(cur, {"id": gid, "stock": stock}, self.operator)
+        db.run_tx(prep)
         return gid
 
     def redeem(self, gid, emp, key=None):
         return domain.redeem(gid, domain.RequestIn(request_id=key or request_key()), emp)
 
     def stock(self, gid):
-        return db.query_one("SELECT stock FROM gifts WHERE id=%s", (gid,))["stock"]
+        return db.query_one(
+            "SELECT COALESCE(SUM(stock),0) AS s FROM gift_stock_bucket WHERE gift_id=%s", (gid,))["s"]
 
     def balance(self, emp):
         return db.query_one("SELECT balance FROM point_accounts WHERE emp_id=%s", (emp,))["balance"]
@@ -245,6 +251,7 @@ class TestRedemption(unittest.TestCase):
         return {t: db.query(f"SELECT * FROM {t} ORDER BY {key}") for t, key in (
             ("users", "emp_id"), ("point_accounts", "emp_id"), ("point_records", "id"),
             ("redemptions", "id"), ("gifts", "id"), ("gift_stock_records", "id"),
+            ("gift_stock_bucket", "gift_id, bucket_no"),
             ("audit_logs", "id"), ("notifications", "id"), ("point_ops", "id"),
             # 通知发件箱也要进快照：它和业务写入同事务，回滚时那些行必须一起消失 ——
             # 「只有提交成功才发通知」就是靠这条断言钉住的。
@@ -424,7 +431,11 @@ class TestRedemption(unittest.TestCase):
     def test_每个事务写入后异常均完整回滚并可重试(self):
         for kind in ("redeem", "cancel", "refund", "ship", "stock"):
             def prepare():
-                emp, gid, key = self.make_user(), self.make_gift(baseline=False), request_key()
+                # 库存下限定为 STOCK_BUCKETS：均分后每桶都 ≥ 1，home 桶必非空 →
+                # 扣减恒只发一条 UPDATE（不随随机 emp 的 home 哈希轮转空桶而多试），
+                # 且总量远在 LOW_STOCK_THRESHOLD 之上 → 不跨阈值、只入队一条。
+                # 这样逐写注入的基准轨迹长度与 emp 无关，fail-at-step 才能对齐。
+                emp, gid, key = self.make_user(), self.make_gift(stock=config.STOCK_BUCKETS, baseline=False), request_key()
                 if kind == "redeem":
                     return lambda: self.redeem(gid, emp, key)
                 if kind == "stock":
@@ -467,7 +478,7 @@ class TestRedemption(unittest.TestCase):
         oid = self.redeem(gid, emp)["redemption_id"]
         self.assert_clean()
         db.execute("UPDATE point_accounts SET balance=balance+2 WHERE emp_id=%s", (emp,))
-        db.execute("UPDATE gifts SET stock=stock+1 WHERE id=%s", (gid,))
+        db.execute("UPDATE gift_stock_bucket SET stock=stock+1 WHERE gift_id=%s AND bucket_no=0", (gid,))
         db.execute("UPDATE redemptions SET points_cost=points_cost+1 WHERE id=%s", (oid,))
         db.execute("INSERT INTO point_records (emp_id,points,ref_type,ref_id) VALUES (%s,1,'refund',2147483647)", (emp,))
         before = self.snapshot()

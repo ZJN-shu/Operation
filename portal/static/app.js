@@ -20,8 +20,14 @@
   let allCourses = [];
   let courseQuery = '';
   let lastSearchResults = [];
+  // OSS 直传能力（登录后拉一次 /api/oss/config；拿不到就当未启用，退回 emoji 录入）
+  let _ossCap = null;
+  let _giftImageKey = '';   // 当前礼品表单已绑定的图片 object key
   let allGifts = [];
   let giftSort = 'hot';
+  // 秒杀：当前场次快照 + 一个驱动倒计时/状态同步的定时器（仅在秒杀 tab 开启）。
+  let allSeckill = [];
+  let seckillTimer = null;
   // 积分明细：当前页的行放在数组里，实时推送就插进数组再整体重渲染。
   // 不直接对 tbody 做 DOM 手术（insertAdjacentHTML / 删最后一个子节点）——
   // 那样「第 1 页插一条、裁到 PAGE_SIZE」的逻辑只能靠浏览器验证，
@@ -272,6 +278,8 @@
   function showLogin() {
     $('#app').classList.add('hidden');
     $('#login-screen').classList.remove('hidden');
+    const box = $('#register-box');
+    if (box) box.classList.add('hidden');   // 下一个人默认看登录，不继承上一个人展开的注册表单
   }
   function showApp() {
     $('#login-screen').classList.add('hidden');
@@ -298,6 +306,35 @@
       localStorage.setItem('ops_session', sessionId);
       enterApp();
     } catch (e) { err.textContent = '网络错误，请稍后再试'; }
+  }
+  // 自助注册：服务端强制 role='user'，注册成功即自动登录（已建会话并发欢迎分）。
+  async function register() {
+    const username = $('#reg-username').value.trim();
+    const password = $('#reg-password').value;
+    const name = $('#reg-name').value.trim();
+    const department = $('#reg-department').value.trim();
+    const err = $('#register-error');
+    err.textContent = '';
+    if (!username || !password) { err.textContent = '请填写用户名和密码'; return; }
+    let res, data;
+    try {
+      res = await fetch('/api/auth/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password, name, department }),
+      });
+      data = await res.json().catch(() => ({}));
+    } catch (e) { err.textContent = '网络错误，请稍后再试'; return; }
+    if (!res.ok) {
+      const detail = Array.isArray(data.detail) ? data.detail.map((x) => x.msg).join('；') : data.detail;
+      err.textContent = detail || '注册失败'; return;
+    }
+    token = data.token;
+    user = data.user;
+    sessionId = data.session_id || '';
+    localStorage.setItem('ops_token', token);
+    localStorage.setItem('ops_session', sessionId);
+    enterApp();
   }
   let loggingOut = false;
 
@@ -348,10 +385,23 @@
     // 管理角色显示后台入口
     $('#admin-toggle').classList.toggle('hidden', !isAdminRole(user.role));
     track('page_visit');
+    loadOssCap();   // fire-and-forget：拿到后礼品卡片/表单才出现图片与上传入口
     // 回到刷新前那一屏。后台视图要按角色卡一道：换了普通用户登录时
     // 不能因为上一个人留在 admin 就恢复到后台（会看到一个空面板）。
     if (view === 'admin' && isAdminRole(user.role)) setView('admin');
     else setView('user');
+  }
+  async function loadOssCap() {
+    // 能力探测失败不影响任何主流程，静默降级为未启用。
+    try { _ossCap = await api('/api/oss/config'); }
+    catch (e) { _ossCap = { enabled: false }; }
+  }
+  function giftImgHtml(g) {
+    // 有 image_key 且配了公开基址才渲染 <img>，否则空串（调用方回退 emoji）。
+    const base = _ossCap && _ossCap.image_base_url;
+    if (!g || !g.image_key || !base) return '';
+    const url = base.replace(/\/$/, '') + '/' + String(g.image_key).replace(/^\//, '');
+    return `<img class="item-img" src="${esc(url)}" alt="${esc(g.name || '')}" loading="lazy" onerror="this.remove()" />`;
   }
   function refreshPoints() {
     if (user) $('#points-badge').textContent = '⭐ ' + user.points;
@@ -398,7 +448,7 @@
     $('#user-main').classList.toggle('hidden', isAdmin);
     $('#admin-panel').classList.toggle('hidden', !isAdmin);
     $('#admin-toggle').textContent = isAdmin ? '👤 返回用户端' : '⚙️ 进入后台';
-    if (isAdmin) { renderAdminNav(); renderAdmin(); }
+    if (isAdmin) { stopSeckillTimer(); renderAdminNav(); renderAdmin(); }
     else { stopPointsStream(); renderUser(); }
   }
   function renderAdminNav() {
@@ -409,6 +459,7 @@
       gifts: ['super_admin', 'shop_admin'],
       orders: ['super_admin', 'shop_admin'],
       audit: ['super_admin'],
+      members: ['super_admin'],
     };
     $$('.admin-nav').forEach((b) => {
       const allowed = perms[b.dataset.section] || [];
@@ -430,9 +481,12 @@
     $$('#user-nav .tab').forEach((b) => b.classList.toggle('active', b.dataset.tab === t));
     $$('.tab-panel').forEach((p) => p.classList.add('hidden'));
     $('#tab-' + t).classList.remove('hidden');
+    // 离开秒杀 tab 就停掉那个每秒刷倒计时的定时器，避免后台空转。
+    if (t !== 'seckill') stopSeckillTimer();
     if (t === 'home') loadHome();
     else if (t === 'courses') loadCourses();
     else if (t === 'gifts') loadGifts();
+    else if (t === 'seckill') { loadSeckill(); startSeckillTimer(); }
     else if (t === 'activities') loadActivities();
     else if (t === 'points') loadPoints();
   }
@@ -597,7 +651,7 @@
       : `<button class="btn-sm" onclick="event.stopPropagation();App.redeemGift(${g.id})">兑换</button>`;
     return `
       <div class="item-card clickable" id="gift-${g.id}" onclick="App.openGiftDetail(${g.id})">
-        <div class="item-emoji">${esc(g.icon)}</div>
+        <div class="item-emoji">${giftImgHtml(g) || esc(g.icon)}</div>
         <div class="item-title">${esc(g.name)}</div>
         <div class="item-meta">${esc(g.category)} · 🔥 ${g.redeemed || 0}</div>
         <div class="item-footer">
@@ -608,6 +662,135 @@
           ${btn}
         </div>
       </div>`;
+  }
+
+  // ================= 秒杀（用户端：场次列表 + 倒计时 + 预约 + 抢购轮询） =================
+  async function loadSeckill() {
+    try {
+      const d = await api('/api/seckill/sessions');
+      allSeckill = d.sessions || [];
+      renderSeckill();
+    } catch (e) { $('#tab-seckill').innerHTML = '<div class="empty">秒杀未开放或加载失败</div>'; }
+  }
+  function fmtCountdown(ms) {
+    if (ms <= 0) return '00:00';
+    const s = Math.floor(ms / 1000);
+    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+    const p = (n) => String(n).padStart(2, '0');
+    return (h > 0 ? p(h) + ':' : '') + p(m) + ':' + p(sec);
+  }
+  function renderSeckill() {
+    const el = $('#tab-seckill');
+    if (!el) return;
+    const now = Date.now();
+    let html = '<div class="section-title">⚡ 限时秒杀</div>';
+    html += '<div class="rec-time" style="margin-bottom:12px">名额到点先到先得；点「预约」只在开抢前 5 分钟给你推送提醒，不占用名额。</div>';
+    if (!allSeckill.length) html += '<div class="empty">当前没有排期的秒杀场次</div>';
+    else html += '<div class="grid grid-3">' + allSeckill.map((s) => renderSeckillCard(s, now)).join('') + '</div>';
+    el.innerHTML = html;
+  }
+  function renderSeckillCard(s, now) {
+    const start = new Date(s.start_at).getTime();
+    let statusHtml, actionHtml;
+    if (s.status === 'live') {
+      statusHtml = '<span class="tag tag-amber">🔴 抢购中</span>';
+      actionHtml = `<button class="btn-sm" onclick="App.grabSeckill(${s.gift_id})">⚡ 立即抢购</button>`;
+    } else {
+      statusHtml = `<span class="tag tag-gray">⏳ ${fmtCountdown(start - now)} 后开抢</span>`;
+      actionHtml = s.reserved
+        ? `<button class="btn-outline" onclick="App.cancelSeckill(${s.id})">已预约 · 取消</button>`
+        : `<button class="btn-sm" onclick="App.reserveSeckill(${s.id})">🔔 预约提醒</button>`;
+    }
+    return `<div class="item-card">
+      <div class="item-emoji">${giftImgHtml(s) || esc(s.icon || '⚡')}</div>
+      <div class="item-title">${esc(s.gift_name)}</div>
+      <div class="item-meta">本场 ${s.stock} 件 · ${statusHtml}</div>
+      <div class="item-footer">
+        <div class="points-num">${s.points_cost} 积分</div>
+        ${actionHtml}
+      </div>
+    </div>`;
+  }
+  async function reserveSeckill(sid) {
+    try { await api(`/api/seckill/sessions/${sid}/reserve`, { method: 'POST' }); toast('已预约，开抢前 5 分钟会提醒你', 'success'); loadSeckill(); }
+    catch (e) { toast(e.message, 'error'); }
+  }
+  async function cancelSeckill(sid) {
+    try { await api(`/api/seckill/sessions/${sid}/reserve`, { method: 'DELETE' }); toast('已取消预约', 'success'); loadSeckill(); }
+    catch (e) { toast(e.message, 'error'); }
+  }
+  async function grabSeckill(gid) {
+    let r;
+    try { r = await api(`/api/seckill/${gid}/grab`, { method: 'POST' }); }
+    catch (e) { toast(e.message, 'error'); loadSeckill(); return; }
+    if (r.state === 'sold_out') { toast('😢 已经抢完了', 'error'); loadSeckill(); return; }
+    if (r.state === 'already') { toast('你已经抢过啦，别贪心', 'error'); return; }
+    if (r.state === 'queued') { toast('抢到名额了，正在下单…', 'success'); pollSeckillResult(r.key); }
+  }
+  async function pollSeckillResult(key) {
+    // 异步下单：拿到名额≠成交，轮询预约结果直到 success/failed 或超时。
+    for (let i = 0; i < 25; i++) {
+      await new Promise((res) => setTimeout(res, 800));
+      let st;
+      try { st = await api('/api/seckill/res/' + encodeURIComponent(key)); } catch (e) { continue; }
+      if (st.state === 'success') { toast('🎉 抢购成功，订单 #' + st.order_id, 'success'); await refreshAll(); loadSeckill(); return; }
+      if (st.state === 'failed') { toast('抢购未成交：' + reasonText(st.reason), 'error'); loadSeckill(); return; }
+    }
+    toast('下单仍在处理中，稍后到「我的积分」查看结果', 'error');
+  }
+  function startSeckillTimer() {
+    stopSeckillTimer();
+    let ticks = 0;
+    seckillTimer = setInterval(() => {
+      if (tab !== 'seckill') return;
+      ticks++;
+      if (ticks % 5 === 0) { loadSeckill(); return; }   // 每 5s 与服务器同步场次状态
+      renderSeckill();                                   // 其余每秒只重画倒计时
+    }, 1000);
+  }
+  function stopSeckillTimer() { if (seckillTimer) { clearInterval(seckillTimer); seckillTimer = null; } }
+
+  // ================= 秒杀（管理端：上架时排期 + 场次列表） =================
+  function openSeckillForm(gid) {
+    const g = (window._adminGiftsCache || []).find((x) => x.id === gid) || {};
+    const d = new Date(Date.now() + 5 * 60000);   // 默认开抢时间 = 当前 + 5 分钟
+    const p = (n) => String(n).padStart(2, '0');
+    const def = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+    openModal(`<h2>⚡ 排秒杀 · ${esc(g.name || ('礼品 #' + gid))}</h2>
+      <p>设定开抢时间，到点系统自动开抢；开抢前 5 分钟给预约的员工发提醒。额度不得超过当前库存（${g.stock ?? '?'}）。</p>
+      <div class="form-grid">
+        <div class="form-field"><label>开抢时间</label><input id="sk-time" type="datetime-local" value="${def}" /></div>
+        <div class="form-field"><label>秒杀额度（件）</label><input id="sk-stock" type="number" min="1" max="1000000" value="${g.stock ?? 1}" /></div>
+      </div>
+      <div class="form-actions">
+        <button class="btn-primary" style="width:auto;padding:10px 20px" onclick="App.saveSeckillSession(${gid})">排期</button>
+        <button class="btn-outline" onclick="App.closeModal()">取消</button>
+      </div>`);
+  }
+  async function saveSeckillSession(gid) {
+    const time = $('#sk-time').value;
+    const stock = Number($('#sk-stock').value || '0');
+    if (!time) { toast('请选择开抢时间', 'error'); return; }
+    try {
+      const s = await api('/api/admin/seckill/sessions', { method: 'POST', body: { gift_id: gid, start_at: time, stock } });
+      toast('已排期：场次 #' + s.id, 'success'); closeModal(); loadAdminGifts();
+    } catch (e) { toast(e.message, 'error'); }
+  }
+  async function endSeckill(sid) {
+    try { await api(`/api/admin/seckill/sessions/${sid}/end`, { method: 'POST' }); toast('已结束该场次', 'success'); loadAdminGifts(); }
+    catch (e) { toast(e.message, 'error'); }
+  }
+  function renderSeckillAdmin(list) {
+    if (!list || !list.length) return '';
+    const label = { scheduled: '⏳ 待开抢', live: '🔴 抢购中', ended: '已结束', cancelled: '已取消' };
+    let html = '<div class="section-title" style="margin-top:20px">⚡ 秒杀场次</div><div class="card"><table class="table"><thead><tr><th>#</th><th>礼品</th><th>开抢时间</th><th>额度</th><th>预约数</th><th>状态</th><th>操作</th></tr></thead><tbody>';
+    html += list.map((s) => `<tr>
+      <td>${s.id}</td><td>${esc(s.gift_name)}</td><td>${fmtDate(s.start_at)}</td><td>${s.stock}</td><td>${s.reserve_count}</td>
+      <td>${esc(label[s.status] || s.status)}</td>
+      <td>${(s.status === 'scheduled' || s.status === 'live') ? `<button class="btn-outline" onclick="App.endSeckill(${s.id})">结束</button>` : ''}</td>
+    </tr>`).join('');
+    html += '</tbody></table></div>';
+    return html;
   }
 
   async function openCourseDetail(id) {
@@ -645,6 +828,7 @@
       openModal(`
         <h2>${esc(g.icon)} ${esc(g.name)}</h2>
         <div class="detail-meta">${esc(g.category)} · 需 <b>${g.points_cost}</b> 积分 · 库存 ${g.stock}</div>
+        ${giftImgHtml(g) ? '<div class="gift-img">' + giftImgHtml(g) + '</div>' : ''}
         <div class="detail-section"><h3>📝 礼品介绍</h3><p>${esc(g.description || '暂无描述')}</p></div>
         <div class="form-actions">${btn}<button class="btn-outline" onclick="App.closeModal()">关闭</button></div>
       `);
@@ -830,6 +1014,7 @@
     else if (s === 'gifts') loadAdminGifts();
     else if (s === 'orders') loadAdminOrders();
     else if (s === 'audit') loadAdminAudit();
+    else if (s === 'members') loadAdminMembers();
   }
 
   // 看板内的 tab 切换。和 setAdminSection 一样要处理实时流的生死。
@@ -1121,7 +1306,10 @@
     const el = $('#sec-gifts');
     el.innerHTML = '<div class="empty">加载中…</div>';
     try {
-      const d = await api('/api/admin/gifts?page=' + adminPage.gifts + '&size=' + PAGE_SIZE);
+      const [d, sd] = await Promise.all([
+        api('/api/admin/gifts?page=' + adminPage.gifts + '&size=' + PAGE_SIZE),
+        api('/api/admin/seckill/sessions').catch(() => ({ sessions: [] })),
+      ]);
       window._adminGiftsCache = d.items;
       let html = '<div class="section-title">🎁 积分兑换 · 礼品管理</div>';
       html += `<button class="btn-primary" style="width:auto;padding:10px 18px" onclick="App.openGiftForm()">➕ 新增礼品</button>`;
@@ -1139,14 +1327,23 @@
             <button class="btn-outline" onclick="App.openGiftForm(${g.id})">✏️ 编辑</button>
             <button class="btn-outline" onclick="App.openStockForm(${g.id})">调整库存</button>
             <button class="btn-outline" onclick="App.toggleStatus('gifts', ${g.id}, '${g.status === 'active' ? 'offline' : 'active'}')">${g.status === 'active' ? '⏸️ 下架' : '✅ 上架'}</button>
+            <button class="btn-outline" onclick="App.openSeckillForm(${g.id})">⚡秒杀</button>
           </td>
         </tr>`).join('');
       html += '</tbody></table>' + renderPager(d.total, d.page, d.size, 'gifts') + '</div>';
+      html += renderSeckillAdmin(sd.sessions);
       el.innerHTML = html;
     } catch (e) { el.innerHTML = '<div class="empty">加载失败</div>'; }
   }
   function openGiftForm(id) {
     const cur = id ? (window._adminGiftsCache || []).find((g) => g.id === id) : null;
+    _giftImageKey = (cur && cur.image_key) || '';   // 编辑时回填已绑定的图片 key
+    const ossRow = (_ossCap && _ossCap.enabled) ? `
+        <div class="form-field full"><label>礼品图片（直传阿里云 OSS）</label>
+          <input id="gf-file" type="file" accept="image/*" />
+          <button class="btn-outline" style="width:auto;padding:6px 14px;margin-top:6px" onclick="App.uploadGiftImage()">上传</button>
+          <div class="rec-time" id="gf-imgkey">${esc(_giftImageKey || '未绑定图片')}</div>
+        </div>` : '';
     openModal(`
       <h2>${id ? '✏️ 编辑礼品' : '➕ 新增礼品'}</h2>
       <div class="form-grid">
@@ -1155,11 +1352,35 @@
         <div class="form-field"><label>积分价格</label><input id="gf-cost" type="number" min="0" max="1000000" value="${cur?.points_cost ?? 0}" /></div>
         ${id ? '<div class="form-field">库存通过独立「调整库存」操作修改</div>' : '<div class="form-field"><label>初始库存</label><input id="gf-stock" type="number" min="0" max="1000000000" value="0" /></div>'}
         <div class="form-field full"><label>emoji 图标</label><input id="gf-icon" value="${esc(cur?.icon || '🎁')}" /></div>
+        ${ossRow}
       </div>
       <div class="form-actions">
         <button class="btn-primary" style="width:auto;padding:10px 20px" onclick="App.saveGift(${id || 0})">保存</button>
         <button class="btn-outline" onclick="App.closeModal()">取消</button>
       </div>`);
+  }
+  async function uploadGiftImage() {
+    const inp = $('#gf-file');
+    const f = inp && inp.files && inp.files[0];
+    if (!f) { toast('请先选择图片', 'error'); return; }
+    const max = (_ossCap && _ossCap.max_bytes) || 0;
+    if (max && f.size > max) { toast('图片超过 ' + Math.round(max / 1024 / 1024) + 'MB 上限', 'error'); return; }
+    try {
+      const cred = await api('/api/admin/oss/upload-credential', { method: 'POST', body: { filename: f.name } });
+      const fd = new FormData();
+      fd.append('key', cred.key);
+      fd.append('OSSAccessKeyId', cred.OSSAccessKeyId);
+      fd.append('policy', cred.policy);
+      fd.append('signature', cred.signature);
+      fd.append('success_action_status', cred.success_action_status);
+      fd.append('Content-Type', f.type || 'image/png');
+      fd.append('file', f);   // file 必须放最后（OSS Post 要求）
+      const res = await fetch(cred.host, { method: 'POST', body: fd });  // 直传到 OSS，不带本站 Authorization
+      if (!res.ok) { toast('直传失败：' + res.status, 'error'); return; }
+      _giftImageKey = cred.key;
+      const box = $('#gf-imgkey'); if (box) box.textContent = cred.key;
+      toast('图片已上传', 'success');
+    } catch (e) { toast('上传出错：' + e.message, 'error'); }
   }
   async function saveGift(id) {
     const body = {
@@ -1167,6 +1388,7 @@
       points_cost: Number($('#gf-cost').value || '0'),
       icon: $('#gf-icon').value,
     };
+    if (_giftImageKey) body.image_key = _giftImageKey;   // 只在已绑定图片时携带
     if (!id) body.stock = Number($('#gf-stock').value || '0');
     try {
       await api(id ? '/api/admin/gifts/' + id : '/api/admin/gifts', { method: id ? 'PUT' : 'POST', body });
@@ -1725,6 +1947,43 @@
     } catch (e) { el.innerHTML = '<div class="empty">加载失败：' + esc(e.message) + '</div>'; }
   }
 
+  // ----- 成员与角色（仅超管） -----
+  async function loadAdminMembers() {
+    const el = $('#sec-members');
+    el.innerHTML = '<div class="empty">加载中…</div>';
+    try {
+      const d = await api('/api/admin/users');
+      const roleOpts = ['user', 'viewer', 'content_admin', 'shop_admin', 'super_admin']
+        .map((r) => `<option value="${r}">${ROLE_LABELS[r] || r}</option>`).join('');
+      let html = '<div class="section-title">👥 成员与角色</div><div class="card"><table class="table">';
+      html += '<thead><tr><th>姓名</th><th>用户名</th><th>部门</th><th>角色</th><th>操作</th></tr></thead><tbody>';
+      html += d.users.map((u) => `
+        <tr>
+          <td>${esc(u.name || '—')}</td>
+          <td>${esc(u.username)}</td>
+          <td>${esc(u.department || '—')}</td>
+          <td><select id="role-${esc(u.emp_id)}" class="role-select">${roleOpts}</select></td>
+          <td><button class="btn-outline" onclick="App.saveUserRole('${esc(u.emp_id)}')">保存</button></td>
+        </tr>`).join('');
+      html += '</tbody></table><p class="login-hint">改角色会吊销该成员当前会话，需其重新登录后新权限界面才生效。</p></div>';
+      el.innerHTML = html;
+      // innerHTML 里给 <option> 打 selected 不稳，事后按当前角色回填每行下拉值
+      d.users.forEach((u) => { const s = $('#role-' + u.emp_id); if (s) s.value = u.role; });
+    } catch (e) { el.innerHTML = '<div class="empty">加载失败：' + esc(e.message) + '</div>'; }
+  }
+  async function saveUserRole(empId) {
+    const sel = $('#role-' + empId);
+    if (!sel) return;
+    const role = sel.value;
+    try {
+      const d = await api('/api/admin/users/' + encodeURIComponent(empId) + '/role',
+        { method: 'PATCH', body: { role } });
+      if (d.unchanged) { toast('角色未变化'); return; }
+      toast('已更新角色，该成员需重新登录', 'success');
+      loadAdminMembers();
+    } catch (e) { toast(e.message, 'error'); }
+  }
+
   // ----- 题目管理 -----
   async function openQuestionManager(cid) {
     openModal('<div class="empty">加载中…</div>');
@@ -1855,6 +2114,10 @@
     $('#login-btn').addEventListener('click', login);
     $('#login-password').addEventListener('keydown', (e) => { if (e.key === 'Enter') login(); });
     $('#logout-btn').addEventListener('click', () => logout(true));
+    const tr = $('#toggle-register');
+    if (tr) tr.addEventListener('click', (e) => { e.preventDefault(); $('#register-box').classList.toggle('hidden'); });
+    $('#register-btn').addEventListener('click', register);
+    $('#reg-password').addEventListener('keydown', (e) => { if (e.key === 'Enter') register(); });
     $('#admin-toggle').addEventListener('click', () => setView(view === 'admin' ? 'user' : 'admin'));
     $('#search-input').addEventListener('input', onSearchInput);
     $('#search-input').addEventListener('blur', () => setTimeout(hideSearch, 200));
@@ -1876,7 +2139,8 @@
     onCourseSearch, clearCourseSearch, onGiftSort,
     openCourseForm, saveCourse,
     openActivityForm, saveActivity, saveCarousel,
-    openGiftForm, saveGift,
+    openGiftForm, saveGift, uploadGiftImage,
+    reserveSeckill, cancelSeckill, grabSeckill, openSeckillForm, saveSeckillSession, endSeckill,
     toggleStatus, shipOrder, submitShip, closeModal, goPage,
     openCourseDetail, openGiftDetail, openAnnouncementDetail, openActivityDetail,
     enrollCourseDetail: (id) => { closeModal(); return doAction(`/api/user/courses/${id}/enroll`, '报名成功'); },
@@ -1886,6 +2150,7 @@
     participateDetail: (id) => { closeModal(); return doAction(`/api/user/activities/${id}/participate`, '参与成功，积分已到账'); },
     openQuiz, submitQuiz,
     openQuestionManager, openQuestionForm, saveQuestion, deleteQuestion,
+    saveUserRole,
     setPointFilter, resetPointFilter,
     setDashTab,
     // 侧栏菜单的入口。挂出来是为了单测：node 里的假 DOM 把 querySelectorAll
